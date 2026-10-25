@@ -6,7 +6,10 @@ import json
 import os
 import re
 import threading
+import time
 import zipfile
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -124,6 +127,12 @@ def get_github_lock():
     return threading.Lock()
 
 
+@st.cache_resource
+def get_gh_state():
+    """Stato condiviso tra sessioni e thread: esito della sincronizzazione iniziale e del backup notturno."""
+    return {"sync_ok": None, "nightly": {"enabled": False, "hour": 2, "tz": "", "next_run": "", "last_run": "", "last_error": ""}}
+
+
 def _gh(conf, method, path, **kwargs):
     headers = {
         "Authorization": f"Bearer {conf['token']}",
@@ -167,13 +176,13 @@ def _gh_ensure_branch(conf):
         raise RuntimeError(_gh_err(made))
 
 
-def _gh_commit(conf, changes, message):
+def _gh_commit(conf, changes, message, lock=None):
     """changes: {percorso_remoto: bytes | None (=elimina)}. Un solo commit sul branch dati. Ritorna "" se ok."""
     if not changes:
         return ""
     repo, branch = conf["repo"], conf["branch"]
     try:
-        with get_github_lock():
+        with (lock or get_github_lock()):
             def make_blob(item):
                 path, data = item
                 if data is None:
@@ -219,11 +228,16 @@ def _gh_commit(conf, changes, message):
         return f"GitHub: {e}"
 
 
-def gh_sync(put_paths, message, deleted=()):
-    """Carica su GitHub i file locali indicati (ed elimina quelli in `deleted`). Ritorna "" se ok o disattivato."""
-    conf = _gh_conf()
+def gh_sync(put_paths, message, deleted=(), conf=None, lock=None, state=None):
+    """Carica su GitHub i file locali indicati (ed elimina quelli in `deleted`). Ritorna "" se ok o disattivato.
+    conf/lock/state si passano solo dal thread del backup notturno (che non può usare st.secrets/cache)."""
+    conf = conf or _gh_conf()
     if not conf:
         return ""
+    state = state or get_gh_state()
+    if state.get("sync_ok") is False:
+        # Se il ripristino iniziale è fallito, il disco locale può essere vuoto/vecchio: non sovrascrivere GitHub.
+        return "ripristino iniziale da GitHub fallito: salvataggio su GitHub sospeso (premi «Risincronizza da GitHub»)"
     changes = {}
     for pth in put_paths:
         if os.path.exists(pth):
@@ -237,7 +251,7 @@ def gh_sync(put_paths, message, deleted=()):
                 changes[rp] = None
     except Exception as e:
         return f"GitHub: {e}"
-    return _gh_commit(conf, changes, message)
+    return _gh_commit(conf, changes, message, lock)
 
 
 def gh_sync_down():
@@ -283,7 +297,59 @@ def gh_sync_down():
 @st.cache_resource(show_spinner="☁️ Sincronizzo il pack da GitHub…")
 def gh_startup_sync():
     """Eseguita una volta per avvio del server: ripristina il pack dopo un riavvio di Streamlit Cloud."""
-    return gh_sync_down()
+    result = gh_sync_down()
+    if _gh_conf():
+        get_gh_state()["sync_ok"] = (result[1] == "")
+    return result
+
+
+# --- BACKUP NOTTURNO AUTOMATICO ---
+def _next_run_time(now, hour):
+    """Prossima occasione (oggi o domani) alle `hour`:00 nello stesso fuso di `now`."""
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    return target if target > now else target + timedelta(days=1)
+
+
+def _nightly_loop(conf, lock, state, hour, tzname):
+    nightly = state["nightly"]
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = None   # fuso non disponibile: usa l'ora del server
+    while True:
+        target = _next_run_time(datetime.now(tz), hour)
+        nightly["next_run"] = target.isoformat(timespec="minutes").replace("T", " ")
+        while True:   # attesa a pezzi: regge anche a sospensioni del PC
+            remaining = (target - datetime.now(tz)).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 300))
+        if state.get("sync_ok") is not True:
+            err = "ripristino iniziale da GitHub non riuscito o non eseguito: backup saltato"
+        else:
+            err = gh_sync(list_local_pack_files(), f"Backup notturno {target:%Y-%m-%d}", conf=conf, lock=lock, state=state)
+        nightly["last_run"] = datetime.now(tz).isoformat(timespec="minutes").replace("T", " ")
+        nightly["last_error"] = err
+        time.sleep(90)   # evita di rilanciarlo nello stesso minuto
+
+
+@st.cache_resource
+def start_nightly_scheduler():
+    """Avvia (una sola volta per processo) il thread che ogni notte carica tutto il pack su GitHub."""
+    state = get_gh_state()
+    conf = _gh_conf()
+    if not conf or str(_secret("NIGHTLY_SYNC", "on")).lower() in ("off", "0", "false", "no"):
+        return state
+    try:
+        hour = int(_secret("NIGHTLY_SYNC_HOUR", "2")) % 24
+    except ValueError:
+        hour = 2
+    tzname = str(_secret("NIGHTLY_SYNC_TZ", "Europe/Rome"))
+    state["nightly"].update(enabled=True, hour=hour, tz=tzname)
+    threading.Thread(
+        target=_nightly_loop, args=(conf, get_github_lock(), state, hour, tzname), daemon=True, name="nightly-backup"
+    ).start()
+    return state
 
 
 def list_local_pack_files():
@@ -326,6 +392,15 @@ def render_storage_panel():
                         st.error(up_err)
                     else:
                         st.toast("Pack caricato su GitHub", icon="✅")
+            nt = get_gh_state()["nightly"]
+            if nt.get("enabled"):
+                st.caption(
+                    f"🌙 Backup notturno automatico alle {nt['hour']:02d}:00 ({nt['tz']}) · "
+                    f"prossimo: {nt.get('next_run') or '—'} · ultimo: {nt.get('last_run') or 'mai'}"
+                )
+                if nt.get("last_error"):
+                    st.warning(f"Ultimo backup notturno non riuscito: {nt['last_error']}")
+                st.caption("Parte solo se l'app è sveglia a quell'ora. I singoli salvataggi vanno comunque su GitHub subito.")
         else:
             st.info(
                 "GitHub non è configurato: i file restano solo sul disco di questo server (su Streamlit Cloud si "
@@ -425,6 +500,10 @@ def delete_sound_realtime(sound_id, sound_file_path):
     if warn:
         st.session_state["gh_warn"] = warn
 
+
+# Avvio: ripristino da GitHub + pianificatore del backup notturno (prima del login)
+gh_startup_sync()
+start_nightly_scheduler()
 
 # ---------------------------------------------------------
 # 1. AUTENTICAZIONE E SESSIONE ISOLATA

@@ -1,4 +1,5 @@
 streamlit>=1.40
 pydub
 requests
+tzdata
 audioop-lts; python_version >= "3.13"
