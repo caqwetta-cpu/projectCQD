@@ -1,7 +1,7 @@
 {
   "entity.player.big_fall": false,
   "entity.player.hurt": true,
-  "entity.player.small_fall": false,
+  "entity.player.small_fall": true,
   "item.bow.shoot": false,
   "entity.player.attack.crit": false
 }
