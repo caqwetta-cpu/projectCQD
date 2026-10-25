@@ -1,0 +1,12 @@
+{
+  "pack": {
+    "pack_format": 46,
+    "min_format": 15,
+    "max_format": 99,
+    "supported_formats": [
+      15,
+      99
+    ],
+    "description": "Custom Sound Pack - Creato con la community"
+  }
+}

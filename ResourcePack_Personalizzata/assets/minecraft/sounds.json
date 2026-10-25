@@ -1,0 +1,123 @@
+{
+  "damage.hit1": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "damage/hit1",
+        "stream": false
+      }
+    ]
+  },
+  "ambient.cave": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "ambient/cave/cave1",
+        "stream": false
+      }
+    ]
+  },
+  "entity.player.attack.sweep": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "entity/player/attack/sweep1",
+        "stream": false
+      }
+    ]
+  },
+  "entity.player.attack.knockback": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "entity/player/attack/knockback1",
+        "stream": false
+      }
+    ]
+  },
+  "entity.player.attack.crit": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "entity/player/attack/crit1",
+        "stream": false
+      }
+    ]
+  },
+  "entity.player.attack.strong": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "entity/player/attack/strong1",
+        "stream": false
+      }
+    ]
+  },
+  "entity.player.attack.weak": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "entity/player/attack/weak1",
+        "stream": false
+      }
+    ]
+  },
+  "entity.player.hurt": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "damage/hit1",
+        "stream": false
+      }
+    ]
+  },
+  "entity.player.big_fall": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "damage/fallbig",
+        "stream": false
+      }
+    ]
+  },
+  "entity.player.small_fall": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "damage/fallsmall",
+        "stream": false
+      }
+    ]
+  },
+  "item.bow.shoot": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "random/bow",
+        "stream": false
+      }
+    ]
+  }
+}
