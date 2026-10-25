@@ -76,6 +76,17 @@
       }
     ]
   },
+  "item.shield.block": {
+    "replace": true,
+    "author": "Cai",
+    "description": "Audio personalizzato caricato da Cai",
+    "sounds": [
+      {
+        "name": "item/shield/block1",
+        "stream": false
+      }
+    ]
+  },
   "entity.player.hurt": {
     "replace": true,
     "author": "Cai",
