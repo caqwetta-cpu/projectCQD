@@ -2,5 +2,5 @@
   "entity.player.big_fall": false,
   "entity.player.hurt": false,
   "entity.player.small_fall": true,
-  "item.bow.shoot": true
+  "item.bow.shoot": false
 }
