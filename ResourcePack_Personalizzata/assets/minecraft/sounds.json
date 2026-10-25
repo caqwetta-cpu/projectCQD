@@ -45,8 +45,9 @@
   },
   "entity.player.attack.crit": {
     "replace": true,
-    "author": "Cai",
-    "description": "Audio personalizzato caricato da Cai",
+    "author": "Cai 🤓",
+    "uploaded_at": 1792928191.4314141,
+    "description": "Audio personalizzato caricato da Cai 🤓",
     "sounds": [
       {
         "name": "entity/player/attack/crit1",
