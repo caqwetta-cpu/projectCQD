@@ -1,5 +1,5 @@
 {
-  "entity.player.big_fall": false,
+  "entity.player.big_fall": true,
   "entity.player.hurt": false,
   "entity.player.small_fall": true
 }
