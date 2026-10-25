@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import io
@@ -5,7 +6,10 @@ import json
 import os
 import re
 import threading
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
+import requests
 import streamlit as st
 from pydub import AudioSegment
 from pydub.utils import which
@@ -13,7 +17,7 @@ from pydub.utils import which
 # ---------------------------------------------------------
 # CONFIGURAZIONE
 # ---------------------------------------------------------
-st.set_page_config(page_title="Minecraft Sound Studio Pro", page_icon="🎵", layout="wide")
+st.set_page_config(page_title="Minecraft Sound Studio Pro", page_icon="🎵", layout="wide", initial_sidebar_state="collapsed")
 
 ORIGINAL_SOUNDS_DIR = "original_sounds"
 OUTPUT_PACK_DIR = "ResourcePack_Personalizzata"
@@ -60,6 +64,17 @@ st.markdown(
         margin-bottom: 12px !important;
         box-shadow: 0 4px 12px rgba(255, 59, 48, 0.25) !important;
     }
+    /* Bottoni più comodi da toccare */
+    .stButton > button { min-height: 44px; }
+    /* iOS ingrandisce la pagina se il testo dei campi è < 16px */
+    input[type="text"], input[type="password"], input[type="search"] { font-size: 16px !important; }
+    /* Telefoni */
+    @media (max-width: 640px) {
+        .block-container { padding: 1rem 0.75rem 3rem 0.75rem !important; }
+        h1 { font-size: 1.6rem !important; }
+        h3 { font-size: 1.15rem !important; }
+        div[data-testid="stAudioInput"] { padding: 6px 8px !important; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -74,36 +89,288 @@ def get_write_lock():
     return threading.Lock()
 
 
+# ---------------------------------------------------------
+# SALVATAGGIO PERMANENTE SU GITHUB (stesso repository, branch dati separato)
+# ---------------------------------------------------------
+# Su Streamlit Community Cloud il disco si cancella a ogni riavvio. Per questo ogni salvataggio viene
+# anche committato su un BRANCH DATI dello stesso repository (default: "pack-data"). Un branch separato
+# serve a NON far riavviare l'app a ogni salvataggio (l'app si riavvia solo se cambia il branch che pubblica).
+# Configurazione (variabili d'ambiente oppure .streamlit/secrets.toml):
+#   GITHUB_TOKEN        token fine-grained con permesso "Contents: Read and write" su quel repository
+#   GITHUB_REPO         "utente/repository"
+#   GITHUB_DATA_BRANCH  (facoltativo) nome del branch dati, default "pack-data"
+GH_API = "https://api.github.com"
+
+
+def _secret(name, default=None):
+    val = os.environ.get(name)
+    if val:
+        return val
+    try:
+        return st.secrets[name]
+    except Exception:
+        return default
+
+
+def _gh_conf():
+    token, repo = _secret("GITHUB_TOKEN"), _secret("GITHUB_REPO")
+    if not token or not repo:
+        return None
+    return {"token": token, "repo": repo, "branch": _secret("GITHUB_DATA_BRANCH", "pack-data")}
+
+
+@st.cache_resource
+def get_github_lock():
+    return threading.Lock()
+
+
+def _gh(conf, method, path, **kwargs):
+    headers = {
+        "Authorization": f"Bearer {conf['token']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    return requests.request(method, GH_API + path, headers=headers, timeout=60, **kwargs)
+
+
+def _gh_err(r):
+    try:
+        msg = r.json().get("message", "")
+    except Exception:
+        msg = ""
+    hint = " (controlla token e permessi)" if r.status_code in (401, 403, 404) else ""
+    return f"GitHub {r.status_code}: {msg}{hint}"
+
+
+def _remote_path(local_path):
+    return os.path.relpath(local_path).replace(os.sep, "/")
+
+
+def _gh_ensure_branch(conf):
+    """Crea il branch dati (a partire dal branch predefinito) se non esiste ancora."""
+    repo, branch = conf["repo"], conf["branch"]
+    r = _gh(conf, "GET", f"/repos/{repo}/git/ref/heads/{branch}")
+    if r.status_code == 200:
+        return
+    if r.status_code != 404:
+        raise RuntimeError(_gh_err(r))
+    info = _gh(conf, "GET", f"/repos/{repo}")
+    if not info.ok:
+        raise RuntimeError(_gh_err(info))
+    default = info.json()["default_branch"]
+    base = _gh(conf, "GET", f"/repos/{repo}/git/ref/heads/{default}")
+    if not base.ok:
+        raise RuntimeError(_gh_err(base))
+    made = _gh(conf, "POST", f"/repos/{repo}/git/refs",
+               json={"ref": f"refs/heads/{branch}", "sha": base.json()["object"]["sha"]})
+    if not made.ok:
+        raise RuntimeError(_gh_err(made))
+
+
+def _gh_commit(conf, changes, message):
+    """changes: {percorso_remoto: bytes | None (=elimina)}. Un solo commit sul branch dati. Ritorna "" se ok."""
+    if not changes:
+        return ""
+    repo, branch = conf["repo"], conf["branch"]
+    try:
+        with get_github_lock():
+            def make_blob(item):
+                path, data = item
+                if data is None:
+                    return path, None
+                r = _gh(conf, "POST", f"/repos/{repo}/git/blobs",
+                        json={"content": base64.b64encode(data).decode(), "encoding": "base64"})
+                if not r.ok:
+                    raise RuntimeError(_gh_err(r))
+                return path, r.json()["sha"]
+
+            with ThreadPoolExecutor(6) as ex:
+                blobs = dict(ex.map(make_blob, changes.items()))
+
+            for _ in range(4):
+                ref = _gh(conf, "GET", f"/repos/{repo}/git/ref/heads/{branch}")
+                if ref.status_code == 404:
+                    _gh_ensure_branch(conf)
+                    continue
+                if not ref.ok:
+                    return _gh_err(ref)
+                head = ref.json()["object"]["sha"]
+                commit = _gh(conf, "GET", f"/repos/{repo}/git/commits/{head}")
+                if not commit.ok:
+                    return _gh_err(commit)
+                base_tree = commit.json()["tree"]["sha"]
+                entries = [{"path": pth, "mode": "100644", "type": "blob", "sha": sha} for pth, sha in blobs.items()]
+                tree = _gh(conf, "POST", f"/repos/{repo}/git/trees", json={"base_tree": base_tree, "tree": entries})
+                if not tree.ok:
+                    return _gh_err(tree)
+                if tree.json()["sha"] == base_tree:
+                    return ""   # nessuna differenza: niente commit vuoto
+                new_commit = _gh(conf, "POST", f"/repos/{repo}/git/commits",
+                                 json={"message": message, "tree": tree.json()["sha"], "parents": [head]})
+                if not new_commit.ok:
+                    return _gh_err(new_commit)
+                upd = _gh(conf, "PATCH", f"/repos/{repo}/git/refs/heads/{branch}", json={"sha": new_commit.json()["sha"]})
+                if upd.ok:
+                    return ""
+                if upd.status_code not in (409, 422):
+                    return _gh_err(upd)
+            return "conflitto su GitHub, riprova tra qualche secondo"
+    except Exception as e:
+        return f"GitHub: {e}"
+
+
+def gh_sync(put_paths, message, deleted=()):
+    """Carica su GitHub i file locali indicati (ed elimina quelli in `deleted`). Ritorna "" se ok o disattivato."""
+    conf = _gh_conf()
+    if not conf:
+        return ""
+    changes = {}
+    for pth in put_paths:
+        if os.path.exists(pth):
+            with open(pth, "rb") as f:
+                changes[_remote_path(pth)] = f.read()
+    try:
+        for pth in deleted:
+            rp = _remote_path(pth)
+            r = _gh(conf, "GET", f"/repos/{conf['repo']}/contents/{rp}", params={"ref": conf["branch"]})
+            if r.status_code == 200:
+                changes[rp] = None
+    except Exception as e:
+        return f"GitHub: {e}"
+    return _gh_commit(conf, changes, message)
+
+
+def gh_sync_down():
+    """Scarica dal branch dati i file mancanti in locale (e i JSON di stato, che vincono sempre). -> (n, errore)."""
+    conf = _gh_conf()
+    if not conf:
+        return 0, ""
+    try:
+        _gh_ensure_branch(conf)
+        r = _gh(conf, "GET", f"/repos/{conf['repo']}/git/trees/{conf['branch']}", params={"recursive": "1"})
+        if not r.ok:
+            return 0, _gh_err(r)
+        prefix = OUTPUT_PACK_DIR.replace(os.sep, "/") + "/"
+        always = {_remote_path(x) for x in (SOUNDS_JSON_PATH, CHECKED_JSON_PATH, MCMETA_PATH)}
+        todo = []
+        for t in r.json().get("tree", []):
+            path = t.get("path", "")
+            if t.get("type") != "blob" or not path.startswith(prefix) or ".." in path.split("/"):
+                continue
+            local = path.replace("/", os.sep)
+            if path in always or not os.path.exists(local):
+                todo.append((path, t["sha"]))
+
+        def fetch(item):
+            path, sha = item
+            rr = _gh(conf, "GET", f"/repos/{conf['repo']}/git/blobs/{sha}")
+            if not rr.ok:
+                raise RuntimeError(_gh_err(rr))
+            data = base64.b64decode(rr.json()["content"])
+            local = path.replace("/", os.sep)
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            with open(local + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(local + ".tmp", local)
+
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(fetch, todo))
+        return len(todo), ""
+    except Exception as e:
+        return 0, f"GitHub: {e}"
+
+
+@st.cache_resource(show_spinner="☁️ Sincronizzo il pack da GitHub…")
+def gh_startup_sync():
+    """Eseguita una volta per avvio del server: ripristina il pack dopo un riavvio di Streamlit Cloud."""
+    return gh_sync_down()
+
+
+def list_local_pack_files():
+    out = []
+    for root, _, files in os.walk(OUTPUT_PACK_DIR):
+        for f in files:
+            if not f.endswith(".tmp"):
+                out.append(os.path.join(root, f))
+    return out
+
+
+def build_pack_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for full in list_local_pack_files():
+            if os.path.basename(full) == "checked_sounds.json":
+                continue
+            z.write(full, os.path.relpath(full, OUTPUT_PACK_DIR))
+    return buf.getvalue()
+
+
+def render_storage_panel():
+    conf = _gh_conf()
+    with st.expander("☁️ Salvataggio permanente e backup", expanded=False):
+        if conf:
+            n_down, err = gh_startup_sync()
+            st.success(f"Collegato a GitHub: `{conf['repo']}` (branch dati `{conf['branch']}`). Ogni salvataggio viene committato qui.")
+            if err:
+                st.error(f"Ultima sincronizzazione fallita: {err}")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("⬇️ Risincronizza da GitHub", use_container_width=True):
+                    gh_startup_sync.clear()
+                    st.rerun()
+            with c2:
+                if st.button("⬆️ Carica tutto il pack su GitHub", use_container_width=True):
+                    with st.spinner("Carico il pack su GitHub…"):
+                        up_err = gh_sync(list_local_pack_files(), "Carica pack completo")
+                    if up_err:
+                        st.error(up_err)
+                    else:
+                        st.toast("Pack caricato su GitHub", icon="✅")
+        else:
+            st.info(
+                "GitHub non è configurato: i file restano solo sul disco di questo server (su Streamlit Cloud si "
+                "cancellano al riavvio). Imposta `GITHUB_TOKEN` e `GITHUB_REPO` nei secrets per il salvataggio permanente."
+            )
+        if st.button("📦 Prepara ZIP del resource pack", use_container_width=True):
+            st.session_state["pack_zip"] = build_pack_zip()
+        if st.session_state.get("pack_zip"):
+            st.download_button(
+                "💾 Scarica ZIP", st.session_state["pack_zip"], file_name="ResourcePack_Personalizzata.zip",
+                mime="application/zip", use_container_width=True,
+            )
+
+
 @st.cache_data(show_spinner=False, max_entries=64)
-def playable_audio(path, mtime, compat):
-    """Restituisce (bytes, mime) pronti per st.audio."""
+def playable_audio(path, mtime):
+    """
+    Restituisce (bytes, mime) riproducibili su QUALSIASI browser (PC, iPhone, Android).
+    Safari/iPhone non legge l'OGG Vorbis, quindi l'anteprima viene convertita:
+    WAV (senza perdita) per i suoni brevi, MP3 per quelli lunghi. Il file salvato nel pack resta OGG.
+    `mtime` fa invalidare la cache quando il file cambia.
+    """
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 200 or (path.lower().endswith(".ogg") and not data.startswith(b"OggS")):
         raise ValueError(f"file vuoto o non valido ({len(data)} byte): rifallo/ricopialo")
-    if not compat:
-        return data, "audio/ogg"
     try:
         seg = AudioSegment.from_file(io.BytesIO(data))
         buf = io.BytesIO()
-        try:
-            seg.export(buf, format="mp3", bitrate="256k")
-            return buf.getvalue(), "audio/mpeg"
-        except Exception:
-            buf = io.BytesIO()
+        if len(seg) < 20_000:
             seg.export(buf, format="wav")
             return buf.getvalue(), "audio/wav"
+        seg.export(buf, format="mp3", bitrate="256k")
+        return buf.getvalue(), "audio/mpeg"
     except Exception:
         return data, "audio/ogg"
 
 
 def show_player(path):
-    """Mostra un player per un file su disco."""
+    """Mostra un player per un file su disco (formato compatibile con tutti i dispositivi)."""
     if not path or not os.path.exists(path):
         st.error("⚠️ File audio non trovato.")
         return
     try:
-        data, mime = playable_audio(path, os.path.getmtime(path), st.session_state.get("compat_audio", False))
+        data, mime = playable_audio(path, os.path.getmtime(path))
         st.audio(data, format=mime)
     except Exception as e:
         st.error(f"⚠️ Impossibile leggere il file: {e}")
@@ -133,6 +400,9 @@ def set_sound_checked(sound_id, is_checked):
         data = get_checked_sounds()
         data[sound_id] = is_checked
         _atomic_write_json(CHECKED_JSON_PATH, data)
+    warn = gh_sync([CHECKED_JSON_PATH], f"Controllato: {sound_id}")
+    if warn:
+        st.session_state["gh_warn"] = warn
 
 
 def delete_sound_realtime(sound_id, sound_file_path):
@@ -151,14 +421,38 @@ def delete_sound_realtime(sound_id, sound_file_path):
             del sounds_data[sound_id]
             _atomic_write_json(SOUNDS_JSON_PATH, sounds_data)
 
+    warn = gh_sync([SOUNDS_JSON_PATH], f"Elimina {sound_id}", deleted=[target_ogg_path])
+    if warn:
+        st.session_state["gh_warn"] = warn
+
 
 # ---------------------------------------------------------
 # 1. AUTENTICAZIONE E SESSIONE ISOLATA
 # ---------------------------------------------------------
+def _login_token(name):
+    return hmac.new(ACCESS_PASSWORD.encode("utf-8"), name.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def _insecure_remote_context():
+    """True se l'app è aperta via http:// da un indirizzo diverso da localhost (il microfono sarebbe bloccato)."""
+    try:
+        url = str(st.context.url)
+    except Exception:
+        return False
+    return url.startswith("http://") and not re.match(r"http://(localhost|127\.0\.0\.1|\[::1\])", url)
+
+
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 if "user_name" not in st.session_state:
     st.session_state["user_name"] = ""
+
+# Rientro automatico dopo un ricaricamento della pagina (se l'utente ha scelto "Resta connesso")
+if not st.session_state["authenticated"]:
+    _qu, _qt = st.query_params.get("u"), st.query_params.get("t")
+    if _qu and _qt and hmac.compare_digest(str(_qt), _login_token(str(_qu))):
+        st.session_state["authenticated"] = True
+        st.session_state["user_name"] = str(_qu)[:40]
 
 if not st.session_state["authenticated"]:
     st.title("🔒 Accesso Riservato - Minecraft Sound Studio Pro")
@@ -167,7 +461,8 @@ if not st.session_state["authenticated"]:
     with st.form("login_form"):
         input_name = st.text_input("👤 Il tuo Nome / Nickname:")
         input_pass = st.text_input("🔑 Password di Accesso:", type="password")
-        submit_btn = st.form_submit_button("🚀 Accedi allo Studio", type="primary")
+        stay_logged = st.checkbox("Resta connesso su questo dispositivo", value=False)
+        submit_btn = st.form_submit_button("🚀 Accedi allo Studio", type="primary", use_container_width=True)
 
         if submit_btn:
             if not hmac.compare_digest(input_pass.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
@@ -175,8 +470,12 @@ if not st.session_state["authenticated"]:
             elif not input_name.strip():
                 st.warning("⚠️ Inserisci un nome utente valido.")
             else:
+                name = input_name.strip()[:40]
                 st.session_state["authenticated"] = True
-                st.session_state["user_name"] = input_name.strip()[:40]
+                st.session_state["user_name"] = name
+                if stay_logged:
+                    st.query_params["u"] = name
+                    st.query_params["t"] = _login_token(name)
                 st.rerun()
     st.stop()
 
@@ -550,6 +849,10 @@ def save_sound_realtime(sound_id, sound_file_path, audio_segment, user_name):
                 "sounds": [{"name": file_key, "stream": bool(is_music_track or is_long)}],
             }
             _atomic_write_json(SOUNDS_JSON_PATH, sounds_data)
+
+        warn = gh_sync([target_ogg_path, SOUNDS_JSON_PATH, MCMETA_PATH], f"Salva {sound_id} ({user_name})")
+        if warn:
+            st.session_state["gh_warn"] = warn   # salvato in locale, ma non su GitHub
         return True, ""
     except Exception as e:
         if os.path.exists(tmp_ogg_path):
@@ -568,6 +871,11 @@ flash_msg = st.session_state.pop("flash", None)
 if flash_msg:
     st.toast(flash_msg, icon="✅")
 
+gh_warn_msg = st.session_state.pop("gh_warn", None)
+if gh_warn_msg:
+    st.warning(f"⚠️ Salvato sul server ma NON su GitHub: {gh_warn_msg}. Usa «Carica tutto il pack su GitHub» per riprovare.")
+
+gh_startup_sync()
 migrate_legacy_entries()
 saved_manifest = get_saved_sounds_manifest()
 checked_manifest = get_checked_sounds()
@@ -590,22 +898,27 @@ for s in VANILLA_SOUNDS_MAP:
 completed_count = len(completed_items)
 progress_pct = (completed_count / total_sounds) * 100.0 if total_sounds else 0.0
 
-st.sidebar.subheader("📈 Progresso Pacchetto Audio")
-st.sidebar.progress(progress_pct / 100.0)
-st.sidebar.metric("Suoni Completati", f"{completed_count} / {total_sounds}", f"{progress_pct:.1f}%")
+if _insecure_remote_context():
+    st.warning(
+        "🎙️ Stai usando l'app via **http://**: su telefono il microfono funziona solo con **HTTPS** "
+        "(il caricamento dei file funziona comunque). Apri l'app da un indirizzo https:// per registrare."
+    )
 
-st.sidebar.checkbox(
-    "🌐 Modalità compatibilità (Safari / iPhone)",
-    key="compat_audio",
-    help="Converte le anteprime in MP3 se il browser non riproduce i file .ogg.",
-)
+st.progress(progress_pct / 100.0)
+head_a, head_b = st.columns([3, 1])
+with head_a:
+    st.caption(
+        f"📈 **{completed_count} / {total_sounds}** suoni completati ({progress_pct:.1f}%)  |  "
+        f"Utente: **{st.session_state['user_name']}** ⚡"
+    )
+with head_b:
+    if st.button("🚪 Disconnetti", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.session_state["user_name"] = ""
+        st.query_params.clear()
+        st.rerun()
 
-st.caption(f"Utente collegato: **{st.session_state['user_name']}** | Salvataggio in tempo reale ⚡")
-
-if st.sidebar.button("🚪 Disconnetti"):
-    st.session_state["authenticated"] = False
-    st.session_state["user_name"] = ""
-    st.rerun()
+render_storage_panel()
 
 # --- GALLERY SUONI COMPLETATI ---
 GALLERY_MAX = 30
@@ -627,21 +940,18 @@ with st.expander(f"🏆 Galleria Suoni Completati ({completed_count}/{total_soun
 st.divider()
 
 # ---------------------------------------------------------
-# 6. FILTRI AVANZATI NEL MENU LATERALE
+# 6. FILTRI (nella pagina, così si vedono anche da telefono)
 # ---------------------------------------------------------
-st.sidebar.header("🔍 Filtri Avanzati")
-
-search_query = st.sidebar.text_input("Cerca per nome o ID:", "").lower().strip()
-
-selected_cat = st.sidebar.radio(
-    "Categoria:",
-    ["Tutti i suoni", "⚔️ Combat & Danni", "👾 Mob & Creature", "🧱 Blocchi & Interazioni", "🎵 Ambiente, UI & Dischi"],
-)
-
-filter_status = st.sidebar.selectbox(
-    "Stato Completamento:",
-    ["Tutti", "✅ Solo Completati", "⏳ Non Completati", "🇨🇳 Controllato"],
-)
+with st.expander("🔍 Filtri e ricerca", expanded=False):
+    search_query = st.text_input("Cerca per nome o ID:", "").lower().strip()
+    selected_cat = st.selectbox(
+        "Categoria:",
+        ["Tutti i suoni", "⚔️ Combat & Danni", "👾 Mob & Creature", "🧱 Blocchi & Interazioni", "🎵 Ambiente, UI & Dischi"],
+    )
+    filter_status = st.selectbox(
+        "Stato Completamento:",
+        ["Tutti", "✅ Solo Completati", "⏳ Non Completati", "🇨🇳 Controllato"],
+    )
 
 filtered_sounds = []
 for s in VANILLA_SOUNDS_MAP:
@@ -671,9 +981,11 @@ if "visible_count" not in st.session_state or st.session_state.get("filter_sig")
 
 displayed_sounds = filtered_sounds[: st.session_state["visible_count"]]
 
-cols = st.columns(2)
+cols = None
 
 for index, sound_info in enumerate(displayed_sounds):
+    if index % 2 == 0:
+        cols = st.columns(2)   # una riga alla volta: sul telefono le schede restano in ordine
     col = cols[index % 2]
     sound_id = sound_info["id"]
     custom_saved_file_path = sound_path_for(sound_info)
@@ -751,7 +1063,7 @@ for index, sound_info in enumerate(displayed_sounds):
             # 1. Caricamento File
             uploaded_file = st.file_uploader(
                 "Carica File Audio",
-                type=["mp3", "wav", "ogg", "m4a", "flac"],
+                type=["mp3", "wav", "ogg", "m4a", "flac", "aac", "opus", "webm", "mp4", "3gp", "amr", "caf"],
                 key=f"file_{sound_id}_{v}",
                 label_visibility="collapsed",
             )
