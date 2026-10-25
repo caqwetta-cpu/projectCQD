@@ -3,5 +3,5 @@
   "entity.player.hurt": true,
   "entity.player.small_fall": true,
   "item.bow.shoot": false,
-  "entity.player.attack.crit": false
+  "entity.player.attack.crit": true
 }
