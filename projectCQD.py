@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import uuid
 import zipfile
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -501,6 +502,173 @@ def delete_sound_realtime(sound_id, sound_file_path):
         st.session_state["gh_warn"] = warn
 
 
+# ---------------------------------------------------------
+# UTENTI, TESTI FISSI, PRESENZA ONLINE E BLOCCO MODIFICHE
+# ---------------------------------------------------------
+USERS = [
+    "Cai 🤓",
+    "Bubolo 🥛",
+    "Cliffy 💀",
+    "Danifio 🐗",
+    "Leoncino25 🧃",
+    "Simone 😎",
+    "Salvatore III 👃🏻",
+    "Walter 👴🏻",
+    "Cristian ☠️",
+]
+
+WELCOME_TEXT = (
+    "👋 **Benvenuto al progetto top secret ProjectCQD (Project Conserva QuarantaDue) di Cai!** "
+    "Ogni suono che caricherai verrà utilizzato per creare una resource pack su Minecraft. "
+    "Per qualsiasi problema contattatemi in qualsiasi modo."
+)
+CREDITS_TEXT = "Progetto realizzato grazie al contributo di Gemini, Claude.ai e Cai"
+
+PRESENCE_TTL = 30   # secondi senza battito = la persona risulta offline
+EDIT_TTL = 40       # secondi senza rinnovo = il blocco su un suono decade (es. chiusura della scheda)
+
+
+@st.cache_resource
+def get_live_state():
+    """Stato condiviso tra tutte le sessioni: chi è online e chi sta modificando quale suono."""
+    return {"lock": threading.Lock(), "presence": {}, "editing": {}}
+
+
+def get_sid():
+    if "sid" not in st.session_state:
+        st.session_state["sid"] = uuid.uuid4().hex
+    return st.session_state["sid"]
+
+
+def live_heartbeat():
+    """Segna questa sessione come online e rinnova i blocchi che detiene."""
+    live = get_live_state()
+    now = time.time()
+    sid = get_sid()
+    held = st.session_state.setdefault("held_locks", set())
+    with live["lock"]:
+        live["presence"][sid] = {"user": st.session_state.get("user_name", ""), "ts": now}
+        for k in [k for k, v in live["presence"].items() if now - v["ts"] > PRESENCE_TTL]:
+            del live["presence"][k]
+        for sound_id in list(held):
+            e = live["editing"].get(sound_id)
+            if e and e["sid"] == sid:
+                e["ts"] = now
+            else:
+                held.discard(sound_id)
+        for k in [k for k, v in live["editing"].items() if now - v["ts"] > EDIT_TTL]:
+            del live["editing"][k]
+
+
+def live_leave():
+    """Alla disconnessione: sparisce dagli online e libera i suoni bloccati."""
+    live = get_live_state()
+    sid = get_sid()
+    with live["lock"]:
+        live["presence"].pop(sid, None)
+        for k in [k for k, v in live["editing"].items() if v["sid"] == sid]:
+            del live["editing"][k]
+    st.session_state["held_locks"] = set()
+
+
+def live_snapshot():
+    live = get_live_state()
+    now = time.time()
+    with live["lock"]:
+        users = sorted({v["user"] for v in live["presence"].values() if v["user"] and now - v["ts"] <= PRESENCE_TTL})
+        editing = {k: dict(v) for k, v in live["editing"].items() if now - v["ts"] <= EDIT_TTL}
+    return users, editing
+
+
+def edit_owner_other(sound_id):
+    """Nome di chi sta modificando il suono da un'altra sessione, altrimenti None."""
+    live = get_live_state()
+    now = time.time()
+    with live["lock"]:
+        e = live["editing"].get(sound_id)
+        if e and e["sid"] != get_sid() and now - e["ts"] <= EDIT_TTL:
+            return e["user"]
+    return None
+
+
+def try_acquire_edit(sound_id):
+    """(True, "") se la sessione può modificare il suono, altrimenti (False, nome di chi lo sta modificando)."""
+    live = get_live_state()
+    now = time.time()
+    sid = get_sid()
+    with live["lock"]:
+        e = live["editing"].get(sound_id)
+        if e and e["sid"] != sid and now - e["ts"] <= EDIT_TTL:
+            return False, e["user"]
+        live["editing"][sound_id] = {"sid": sid, "user": st.session_state.get("user_name", ""), "ts": now}
+    st.session_state.setdefault("held_locks", set()).add(sound_id)
+    return True, ""
+
+
+def release_edit(sound_id):
+    live = get_live_state()
+    with live["lock"]:
+        e = live["editing"].get(sound_id)
+        if e and e["sid"] == get_sid():
+            del live["editing"][sound_id]
+    st.session_state.setdefault("held_locks", set()).discard(sound_id)
+
+
+@st.fragment(run_every=5)
+def render_live_panel():
+    """Pannello che si aggiorna da solo ogni 5 secondi: persone online e suoni in lavorazione."""
+    live_heartbeat()
+    users, editing = live_snapshot()
+    st.markdown(f"🟢 **{len(users)}** {'persona online' if len(users) == 1 else 'persone online'}")
+    if users:
+        st.caption("   ".join(f"🟢 {u}" for u in users))
+    if editing:
+        for sound_id, e in editing.items():
+            st.markdown(f"✍️ **{e['user']}** sta caricando «{SOUND_LABELS.get(sound_id, sound_id)}»")
+    else:
+        st.caption("Nessuno sta caricando suoni in questo momento.")
+
+
+def fmt_ts(ts):
+    try:
+        tz = ZoneInfo("Europe/Rome")
+    except Exception:
+        tz = None
+    return datetime.fromtimestamp(ts, tz).strftime("%d/%m/%Y %H:%M")
+
+
+def upload_ts(entry, path):
+    """Data di caricamento: dal manifest se c'è, altrimenti data del file su disco."""
+    ts = entry.get("uploaded_at")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def render_showcase_video():
+    """Video showcase: URL nei secrets (SHOWCASE_VIDEO_URL) oppure file showcase.mp4/.webm/.mov nel repository."""
+    url = _secret("SHOWCASE_VIDEO_URL")
+    src = None
+    if url:
+        src = re.sub(r"https://github\.com/([^/]+/[^/]+)/blob/(.+)", r"https://raw.githubusercontent.com/\1/\2", str(url).strip())
+    else:
+        for cand in ("showcase.mp4", "showcase.webm", "showcase.mov",
+                     os.path.join("showcase", "showcase.mp4"), os.path.join("showcase", "showcase.webm")):
+            if os.path.exists(cand):
+                src = cand
+                break
+    if not src:
+        st.info("Il video showcase sarà disponibile a breve.")
+        return
+    try:
+        st.video(src)
+    except Exception as e:
+        st.warning(f"Impossibile caricare il video: {e}")
+
+
 # Avvio: ripristino da GitHub + pianificatore del backup notturno (prima del login)
 gh_startup_sync()
 start_nightly_scheduler()
@@ -529,16 +697,17 @@ if "user_name" not in st.session_state:
 # Rientro automatico dopo un ricaricamento della pagina (se l'utente ha scelto "Resta connesso")
 if not st.session_state["authenticated"]:
     _qu, _qt = st.query_params.get("u"), st.query_params.get("t")
-    if _qu and _qt and hmac.compare_digest(str(_qt), _login_token(str(_qu))):
+    if _qu in USERS and _qt and hmac.compare_digest(str(_qt), _login_token(str(_qu))):
         st.session_state["authenticated"] = True
         st.session_state["user_name"] = str(_qu)[:40]
 
 if not st.session_state["authenticated"]:
     st.title("🔒 Accesso Riservato - Minecraft Sound Studio Pro")
-    st.write("Inserisci il tuo Nickname e la Password per accedere al progetto.")
+    st.info(WELCOME_TEXT)
+    st.write("Scegli chi sei dalla lista e inserisci la Password per accedere al progetto.")
 
     with st.form("login_form"):
-        input_name = st.text_input("👤 Il tuo Nome / Nickname:")
+        input_name = st.selectbox("👤 Chi sei?", USERS, index=None, placeholder="Scegli il tuo nome…")
         input_pass = st.text_input("🔑 Password di Accesso:", type="password")
         stay_logged = st.checkbox("Resta connesso su questo dispositivo", value=False)
         submit_btn = st.form_submit_button("🚀 Accedi allo Studio", type="primary", use_container_width=True)
@@ -546,16 +715,18 @@ if not st.session_state["authenticated"]:
         if submit_btn:
             if not hmac.compare_digest(input_pass.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
                 st.error("❌ Password errata! Riprova.")
-            elif not input_name.strip():
-                st.warning("⚠️ Inserisci un nome utente valido.")
+            elif input_name not in USERS:
+                st.warning("⚠️ Scegli chi sei dalla lista.")
             else:
-                name = input_name.strip()[:40]
+                name = input_name
                 st.session_state["authenticated"] = True
                 st.session_state["user_name"] = name
                 if stay_logged:
                     st.query_params["u"] = name
                     st.query_params["t"] = _login_token(name)
                 st.rerun()
+    st.divider()
+    st.caption(CREDITS_TEXT)
     st.stop()
 
 # ---------------------------------------------------------
@@ -791,6 +962,8 @@ VANILLA_SOUNDS_MAP = [
     {"id": "music.dragon", "file": "music/game/end/boss.ogg", "label": "Musica - Boss Drago dell'End", "cat": "🎵 Ambiente, UI & Dischi"}
 ]
 
+SOUND_LABELS = {s["id"]: s["label"] for s in VANILLA_SOUNDS_MAP}
+
 LEGACY_ENTRIES = [
     ('entity.player.hurt', 'entity/player/hurt1.ogg', 'entity.player.hurt', 'damage/hit1.ogg'),
     ('entity.player.big_fall', 'entity/player/big_fall.ogg', 'entity.player.big_fall', 'damage/fallbig.ogg'),
@@ -924,6 +1097,7 @@ def save_sound_realtime(sound_id, sound_file_path, audio_segment, user_name):
             sounds_data[sound_id] = {
                 "replace": True,
                 "author": user_name,
+                "uploaded_at": time.time(),
                 "description": f"Audio personalizzato caricato da {user_name}",
                 "sounds": [{"name": file_key, "stream": bool(is_music_track or is_long)}],
             }
@@ -945,6 +1119,14 @@ def save_sound_realtime(sound_id, sound_file_path, audio_segment, user_name):
 # 5. INTESTAZIONE & DASHBOARD SUONI COMPLETATI
 # ---------------------------------------------------------
 st.title("🎵 Minecraft Sound Studio Pro")
+live_heartbeat()
+st.info(WELCOME_TEXT)
+
+with st.expander("🎬 Guarda il video showcase (come funziona)", expanded=False):
+    render_showcase_video()
+
+with st.container(border=True):
+    render_live_panel()
 
 flash_msg = st.session_state.pop("flash", None)
 if flash_msg:
@@ -961,12 +1143,14 @@ checked_manifest = get_checked_sounds()
 total_sounds = len(VANILLA_SOUNDS_MAP)
 
 done_map = {}
+ts_map = {}
 completed_items = []
 for s in VANILLA_SOUNDS_MAP:
     p = sound_path_for(s)
     done = is_valid_audio_file(p) and s["id"] in saved_manifest
     done_map[s["id"]] = done
     if done:
+        ts_map[s["id"]] = upload_ts(saved_manifest[s["id"]], p)
         completed_items.append({
             "label": s["label"],
             "id": s["id"],
@@ -992,6 +1176,7 @@ with head_a:
     )
 with head_b:
     if st.button("🚪 Disconnetti", use_container_width=True):
+        live_leave()
         st.session_state["authenticated"] = False
         st.session_state["user_name"] = ""
         st.query_params.clear()
@@ -1031,6 +1216,8 @@ with st.expander("🔍 Filtri e ricerca", expanded=False):
         "Stato Completamento:",
         ["Tutti", "✅ Solo Completati", "⏳ Non Completati", "🇨🇳 Controllato"],
     )
+    SORT_OPTIONS = ["Ordine predefinito", "🆕 Dal più recente al più vecchio", "🕰️ Dal più vecchio al più recente"]
+    sort_mode = st.selectbox("Ordina per data di caricamento:", SORT_OPTIONS)
 
 filtered_sounds = []
 for s in VANILLA_SOUNDS_MAP:
@@ -1048,12 +1235,19 @@ for s in VANILLA_SOUNDS_MAP:
         continue
     filtered_sounds.append(s)
 
+if sort_mode != SORT_OPTIONS[0]:
+    # i suoni caricati vanno ordinati per data; quelli ancora senza audio restano in fondo
+    with_date = [s for s in filtered_sounds if s["id"] in ts_map]
+    without_date = [s for s in filtered_sounds if s["id"] not in ts_map]
+    with_date.sort(key=lambda s: ts_map[s["id"]], reverse=(sort_mode == SORT_OPTIONS[1]))
+    filtered_sounds = with_date + without_date
+
 st.write(f"📊 Suoni Trovati: **{len(filtered_sounds)}**")
 
 # ---------------------------------------------------------
 # 7. SCHEDE SUONI & EDITOR DIRETTO
 # ---------------------------------------------------------
-filter_sig = (search_query, selected_cat, filter_status)
+filter_sig = (search_query, selected_cat, filter_status, sort_mode)
 if "visible_count" not in st.session_state or st.session_state.get("filter_sig") != filter_sig:
     st.session_state["visible_count"] = 10
     st.session_state["filter_sig"] = filter_sig
@@ -1106,7 +1300,10 @@ for index, sound_info in enumerate(displayed_sounds):
 
             # --- AUDIO PERSONALIZZATO ---
             if is_already_saved:
-                st.success(f"🟢 **Audio Presente** (Autore: **{saved_author}**)")
+                st.success(
+                    f"🟢 **Audio Presente** (Autore: **{saved_author}**)  \n"
+                    f"📅 Caricato il {fmt_ts(ts_map[sound_id])}"
+                )
                 show_player(custom_saved_file_path)
 
                 # PULSANTE E CONFERMA ELIMINAZIONE
@@ -1139,12 +1336,17 @@ for index, sound_info in enumerate(displayed_sounds):
             else:
                 st.markdown("**📤 Carica File o Registra dal Microfono:**")
 
+            locked_by = edit_owner_other(sound_id)
+            if locked_by:
+                st.warning(f"🔒 **{locked_by}** sta modificando questo suono in questo momento. Attendi che finisca.")
+
             # 1. Caricamento File
             uploaded_file = st.file_uploader(
                 "Carica File Audio",
                 type=["mp3", "wav", "ogg", "m4a", "flac", "aac", "opus", "webm", "mp4", "3gp", "amr", "caf"],
                 key=f"file_{sound_id}_{v}",
                 label_visibility="collapsed",
+                disabled=bool(locked_by),
             )
 
             # 2. Registratore Microfono Diretto
@@ -1152,16 +1354,31 @@ for index, sound_info in enumerate(displayed_sounds):
             if hasattr(st, "audio_input"):
                 try:
                     recorded_audio = st.audio_input(
-                        "🎙️ Registra Microfono", key=f"rec_{sound_id}_{v}", sample_rate=48000
+                        "🎙️ Registra Microfono", key=f"rec_{sound_id}_{v}", sample_rate=48000,
+                        disabled=bool(locked_by),
                     )
                 except TypeError:
-                    recorded_audio = st.audio_input("🎙️ Registra Microfono", key=f"rec_{sound_id}_{v}")
+                    recorded_audio = st.audio_input(
+                        "🎙️ Registra Microfono", key=f"rec_{sound_id}_{v}", disabled=bool(locked_by)
+                    )
                     st.caption("⚠️ Aggiorna Streamlit (`pip install -U streamlit`) per registrare a qualità piena.")
             else:
                 st.caption("🎙️ Registrazione non disponibile: aggiorna Streamlit (`pip install -U streamlit`).")
 
             candidate_file = uploaded_file or recorded_audio
             from_mic = candidate_file is not None and candidate_file is recorded_audio and uploaded_file is None
+
+            # Blocco: solo una persona alla volta può modificare lo stesso suono
+            if candidate_file is not None:
+                got_lock, lock_owner = try_acquire_edit(sound_id)
+                if not got_lock:
+                    st.error(f"✋ **{lock_owner}** ha appena iniziato a modificare questo suono. Riprova quando ha finito.")
+                    if st.button("Scarta il mio file", key=f"discard_{sound_id}_{v}", use_container_width=True):
+                        st.session_state[version_key] += 1
+                        st.rerun()
+                    candidate_file = None
+            elif sound_id in st.session_state.get("held_locks", set()):
+                release_edit(sound_id)   # file rimosso: libera il suono per gli altri
 
             # --- EDITOR AUDIO ---
             if candidate_file is not None:
@@ -1178,7 +1395,7 @@ for index, sound_info in enumerate(displayed_sounds):
                     if from_mic:
                         cut_click = st.checkbox(
                             "Rimuovi il click iniziale del mouse (primi 350 ms)",
-                            value=True,
+                            value=False,
                             key=f"click_{sound_id}_{v}_{file_id}",
                         )
                         if cut_click and len(raw_audio) > 400:
@@ -1223,6 +1440,7 @@ for index, sound_info in enumerate(displayed_sounds):
                                         sound_id, sound_info["file"], edited_audio, st.session_state["user_name"]
                                     )
                                     if ok:
+                                        release_edit(sound_id)
                                         st.session_state[version_key] += 1
                                         st.session_state["flash"] = (
                                             f"Salvato «{sound_info['label']}» da {st.session_state['user_name']}!"
@@ -1232,6 +1450,7 @@ for index, sound_info in enumerate(displayed_sounds):
                                         st.error(f"Errore salvataggio: {err}")
                             with btn_col2:
                                 if st.button("❌ Annulla / Scarta", key=f"cancel_{sound_id}_{v}", use_container_width=True):
+                                    release_edit(sound_id)
                                     st.session_state[version_key] += 1
                                     st.rerun()
                     else:
@@ -1245,3 +1464,6 @@ if len(displayed_sounds) < len(filtered_sounds):
     if st.button("👇 Carica altri suoni...", use_container_width=True, type="secondary"):
         st.session_state["visible_count"] += 10
         st.rerun()
+
+st.divider()
+st.caption(CREDITS_TEXT)
