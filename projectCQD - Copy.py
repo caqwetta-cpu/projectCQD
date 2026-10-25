@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import io
@@ -5,7 +6,14 @@ import json
 import os
 import re
 import threading
+import time
+import uuid
+import zipfile
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
 
+import requests
 import streamlit as st
 from pydub import AudioSegment
 from pydub.utils import which
@@ -13,13 +21,14 @@ from pydub.utils import which
 # ---------------------------------------------------------
 # CONFIGURAZIONE
 # ---------------------------------------------------------
-st.set_page_config(page_title="Minecraft Sound Studio Pro", page_icon="🎵", layout="wide")
+st.set_page_config(page_title="Minecraft Sound Studio Pro", page_icon="🎵", layout="wide", initial_sidebar_state="collapsed")
 
 ORIGINAL_SOUNDS_DIR = "original_sounds"
 OUTPUT_PACK_DIR = "ResourcePack_Personalizzata"
 SOUNDS_DIR = os.path.join(OUTPUT_PACK_DIR, "assets", "minecraft", "sounds")
 SOUNDS_JSON_PATH = os.path.join(OUTPUT_PACK_DIR, "assets", "minecraft", "sounds.json")
 MCMETA_PATH = os.path.join(OUTPUT_PACK_DIR, "pack.mcmeta")
+CHECKED_JSON_PATH = os.path.join(OUTPUT_PACK_DIR, "checked_sounds.json")
 
 
 def _load_password():
@@ -30,13 +39,12 @@ def _load_password():
     try:
         return st.secrets["ACCESS_PASSWORD"]
     except Exception:
-        # Fallback temporaneo: cambialo e impostalo fuori dal codice!
         return "Caccadura24"
 
 
 ACCESS_PASSWORD = _load_password()
 
-# pydub ha bisogno di ffmpeg: senza, l'audio caricato non si legge né si salva
+# pydub ha bisogno di ffmpeg
 if not which("ffmpeg"):
     st.error(
         "❌ **ffmpeg non trovato.** pydub ne ha bisogno per leggere/convertire l'audio "
@@ -60,54 +68,385 @@ st.markdown(
         margin-bottom: 12px !important;
         box-shadow: 0 4px 12px rgba(255, 59, 48, 0.25) !important;
     }
+    /* Bottoni più comodi da toccare */
+    .stButton > button { min-height: 44px; }
+    /* iOS ingrandisce la pagina se il testo dei campi è < 16px */
+    input[type="text"], input[type="password"], input[type="search"] { font-size: 16px !important; }
+    /* Telefoni */
+    @media (max-width: 640px) {
+        .block-container { padding: 1rem 0.75rem 3rem 0.75rem !important; }
+        h1 { font-size: 1.6rem !important; }
+        h3 { font-size: 1.15rem !important; }
+        div[data-testid="stAudioInput"] { padding: 6px 8px !important; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------
-# HELPER AUDIO
+# HELPER AUDIO & CHECKED
 # ---------------------------------------------------------
 @st.cache_resource
 def get_write_lock():
-    """Lock condiviso tra tutte le sessioni: evita che due utenti corrompano sounds.json."""
+    """Lock condiviso tra tutte le sessioni."""
     return threading.Lock()
 
 
+# ---------------------------------------------------------
+# SALVATAGGIO PERMANENTE SU GITHUB (stesso repository, branch dati separato)
+# ---------------------------------------------------------
+# Su Streamlit Community Cloud il disco si cancella a ogni riavvio. Per questo ogni salvataggio viene
+# anche committato su un BRANCH DATI dello stesso repository (default: "pack-data"). Un branch separato
+# serve a NON far riavviare l'app a ogni salvataggio (l'app si riavvia solo se cambia il branch che pubblica).
+# Configurazione (variabili d'ambiente oppure .streamlit/secrets.toml):
+#   GITHUB_TOKEN        token fine-grained con permesso "Contents: Read and write" su quel repository
+#   GITHUB_REPO         "utente/repository"
+#   GITHUB_DATA_BRANCH  (facoltativo) nome del branch dati, default "pack-data"
+GH_API = "https://api.github.com"
+
+
+def _secret(name, default=None):
+    val = os.environ.get(name)
+    if val:
+        return val
+    try:
+        return st.secrets[name]
+    except Exception:
+        return default
+
+
+def _gh_conf():
+    token, repo = _secret("GITHUB_TOKEN"), _secret("GITHUB_REPO")
+    if not token or not repo:
+        return None
+    return {"token": token, "repo": repo, "branch": _secret("GITHUB_DATA_BRANCH", "pack-data")}
+
+
+@st.cache_resource
+def get_github_lock():
+    return threading.Lock()
+
+
+@st.cache_resource
+def get_gh_state():
+    """Stato condiviso tra sessioni e thread: esito della sincronizzazione iniziale e del backup notturno."""
+    return {"sync_ok": None, "nightly": {"enabled": False, "hour": 2, "tz": "", "next_run": "", "last_run": "", "last_error": ""}}
+
+
+def _gh(conf, method, path, **kwargs):
+    headers = {
+        "Authorization": f"Bearer {conf['token']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    return requests.request(method, GH_API + path, headers=headers, timeout=60, **kwargs)
+
+
+def _gh_err(r):
+    try:
+        msg = r.json().get("message", "")
+    except Exception:
+        msg = ""
+    hint = " (controlla token e permessi)" if r.status_code in (401, 403, 404) else ""
+    return f"GitHub {r.status_code}: {msg}{hint}"
+
+
+def _remote_path(local_path):
+    return os.path.relpath(local_path).replace(os.sep, "/")
+
+
+def _gh_ensure_branch(conf):
+    """Crea il branch dati (a partire dal branch predefinito) se non esiste ancora."""
+    repo, branch = conf["repo"], conf["branch"]
+    r = _gh(conf, "GET", f"/repos/{repo}/git/ref/heads/{branch}")
+    if r.status_code == 200:
+        return
+    if r.status_code != 404:
+        raise RuntimeError(_gh_err(r))
+    info = _gh(conf, "GET", f"/repos/{repo}")
+    if not info.ok:
+        raise RuntimeError(_gh_err(info))
+    default = info.json()["default_branch"]
+    base = _gh(conf, "GET", f"/repos/{repo}/git/ref/heads/{default}")
+    if not base.ok:
+        raise RuntimeError(_gh_err(base))
+    made = _gh(conf, "POST", f"/repos/{repo}/git/refs",
+               json={"ref": f"refs/heads/{branch}", "sha": base.json()["object"]["sha"]})
+    if not made.ok:
+        raise RuntimeError(_gh_err(made))
+
+
+def _gh_commit(conf, changes, message, lock=None):
+    """changes: {percorso_remoto: bytes | None (=elimina)}. Un solo commit sul branch dati. Ritorna "" se ok."""
+    if not changes:
+        return ""
+    repo, branch = conf["repo"], conf["branch"]
+    try:
+        with (lock or get_github_lock()):
+            def make_blob(item):
+                path, data = item
+                if data is None:
+                    return path, None
+                r = _gh(conf, "POST", f"/repos/{repo}/git/blobs",
+                        json={"content": base64.b64encode(data).decode(), "encoding": "base64"})
+                if not r.ok:
+                    raise RuntimeError(_gh_err(r))
+                return path, r.json()["sha"]
+
+            with ThreadPoolExecutor(6) as ex:
+                blobs = dict(ex.map(make_blob, changes.items()))
+
+            for _ in range(4):
+                ref = _gh(conf, "GET", f"/repos/{repo}/git/ref/heads/{branch}")
+                if ref.status_code == 404:
+                    _gh_ensure_branch(conf)
+                    continue
+                if not ref.ok:
+                    return _gh_err(ref)
+                head = ref.json()["object"]["sha"]
+                commit = _gh(conf, "GET", f"/repos/{repo}/git/commits/{head}")
+                if not commit.ok:
+                    return _gh_err(commit)
+                base_tree = commit.json()["tree"]["sha"]
+                entries = [{"path": pth, "mode": "100644", "type": "blob", "sha": sha} for pth, sha in blobs.items()]
+                tree = _gh(conf, "POST", f"/repos/{repo}/git/trees", json={"base_tree": base_tree, "tree": entries})
+                if not tree.ok:
+                    return _gh_err(tree)
+                if tree.json()["sha"] == base_tree:
+                    return ""   # nessuna differenza: niente commit vuoto
+                new_commit = _gh(conf, "POST", f"/repos/{repo}/git/commits",
+                                 json={"message": message, "tree": tree.json()["sha"], "parents": [head]})
+                if not new_commit.ok:
+                    return _gh_err(new_commit)
+                upd = _gh(conf, "PATCH", f"/repos/{repo}/git/refs/heads/{branch}", json={"sha": new_commit.json()["sha"]})
+                if upd.ok:
+                    return ""
+                if upd.status_code not in (409, 422):
+                    return _gh_err(upd)
+            return "conflitto su GitHub, riprova tra qualche secondo"
+    except Exception as e:
+        return f"GitHub: {e}"
+
+
+def gh_sync(put_paths, message, deleted=(), conf=None, lock=None, state=None):
+    """Carica su GitHub i file locali indicati (ed elimina quelli in `deleted`). Ritorna "" se ok o disattivato.
+    conf/lock/state si passano solo dal thread del backup notturno (che non può usare st.secrets/cache)."""
+    conf = conf or _gh_conf()
+    if not conf:
+        return ""
+    state = state or get_gh_state()
+    if state.get("sync_ok") is False:
+        # Se il ripristino iniziale è fallito, il disco locale può essere vuoto/vecchio: non sovrascrivere GitHub.
+        return "ripristino iniziale da GitHub fallito: salvataggio su GitHub sospeso (premi «Risincronizza da GitHub»)"
+    changes = {}
+    for pth in put_paths:
+        if os.path.exists(pth):
+            with open(pth, "rb") as f:
+                changes[_remote_path(pth)] = f.read()
+    try:
+        for pth in deleted:
+            rp = _remote_path(pth)
+            r = _gh(conf, "GET", f"/repos/{conf['repo']}/contents/{rp}", params={"ref": conf["branch"]})
+            if r.status_code == 200:
+                changes[rp] = None
+    except Exception as e:
+        return f"GitHub: {e}"
+    return _gh_commit(conf, changes, message, lock)
+
+
+def gh_sync_down():
+    """Scarica dal branch dati i file mancanti in locale (e i JSON di stato, che vincono sempre). -> (n, errore)."""
+    conf = _gh_conf()
+    if not conf:
+        return 0, ""
+    try:
+        _gh_ensure_branch(conf)
+        r = _gh(conf, "GET", f"/repos/{conf['repo']}/git/trees/{conf['branch']}", params={"recursive": "1"})
+        if not r.ok:
+            return 0, _gh_err(r)
+        prefix = OUTPUT_PACK_DIR.replace(os.sep, "/") + "/"
+        always = {_remote_path(x) for x in (SOUNDS_JSON_PATH, CHECKED_JSON_PATH, MCMETA_PATH)}
+        todo = []
+        for t in r.json().get("tree", []):
+            path = t.get("path", "")
+            if t.get("type") != "blob" or not path.startswith(prefix) or ".." in path.split("/"):
+                continue
+            local = path.replace("/", os.sep)
+            if path in always or not os.path.exists(local):
+                todo.append((path, t["sha"]))
+
+        def fetch(item):
+            path, sha = item
+            rr = _gh(conf, "GET", f"/repos/{conf['repo']}/git/blobs/{sha}")
+            if not rr.ok:
+                raise RuntimeError(_gh_err(rr))
+            data = base64.b64decode(rr.json()["content"])
+            local = path.replace("/", os.sep)
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            with open(local + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(local + ".tmp", local)
+
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(fetch, todo))
+        return len(todo), ""
+    except Exception as e:
+        return 0, f"GitHub: {e}"
+
+
+@st.cache_resource(show_spinner="☁️ Sincronizzo il pack da GitHub…")
+def gh_startup_sync():
+    """Eseguita una volta per avvio del server: ripristina il pack dopo un riavvio di Streamlit Cloud."""
+    result = gh_sync_down()
+    if _gh_conf():
+        get_gh_state()["sync_ok"] = (result[1] == "")
+    return result
+
+
+# --- BACKUP NOTTURNO AUTOMATICO ---
+def _next_run_time(now, hour):
+    """Prossima occasione (oggi o domani) alle `hour`:00 nello stesso fuso di `now`."""
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    return target if target > now else target + timedelta(days=1)
+
+
+def _nightly_loop(conf, lock, state, hour, tzname):
+    nightly = state["nightly"]
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = None   # fuso non disponibile: usa l'ora del server
+    while True:
+        target = _next_run_time(datetime.now(tz), hour)
+        nightly["next_run"] = target.isoformat(timespec="minutes").replace("T", " ")
+        while True:   # attesa a pezzi: regge anche a sospensioni del PC
+            remaining = (target - datetime.now(tz)).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 300))
+        if state.get("sync_ok") is not True:
+            err = "ripristino iniziale da GitHub non riuscito o non eseguito: backup saltato"
+        else:
+            err = gh_sync(list_local_pack_files(), f"Backup notturno {target:%Y-%m-%d}", conf=conf, lock=lock, state=state)
+        nightly["last_run"] = datetime.now(tz).isoformat(timespec="minutes").replace("T", " ")
+        nightly["last_error"] = err
+        time.sleep(90)   # evita di rilanciarlo nello stesso minuto
+
+
+@st.cache_resource
+def start_nightly_scheduler():
+    """Avvia (una sola volta per processo) il thread che ogni notte carica tutto il pack su GitHub."""
+    state = get_gh_state()
+    conf = _gh_conf()
+    if not conf or str(_secret("NIGHTLY_SYNC", "on")).lower() in ("off", "0", "false", "no"):
+        return state
+    try:
+        hour = int(_secret("NIGHTLY_SYNC_HOUR", "2")) % 24
+    except ValueError:
+        hour = 2
+    tzname = str(_secret("NIGHTLY_SYNC_TZ", "Europe/Rome"))
+    state["nightly"].update(enabled=True, hour=hour, tz=tzname)
+    threading.Thread(
+        target=_nightly_loop, args=(conf, get_github_lock(), state, hour, tzname), daemon=True, name="nightly-backup"
+    ).start()
+    return state
+
+
+def list_local_pack_files():
+    out = []
+    for root, _, files in os.walk(OUTPUT_PACK_DIR):
+        for f in files:
+            if not f.endswith(".tmp"):
+                out.append(os.path.join(root, f))
+    return out
+
+
+def build_pack_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for full in list_local_pack_files():
+            if os.path.basename(full) == "checked_sounds.json":
+                continue
+            z.write(full, os.path.relpath(full, OUTPUT_PACK_DIR))
+    return buf.getvalue()
+
+
+def render_storage_panel():
+    conf = _gh_conf()
+    with st.expander("☁️ Salvataggio permanente e backup", expanded=False):
+        if conf:
+            n_down, err = gh_startup_sync()
+            st.success(f"Collegato a GitHub: `{conf['repo']}` (branch dati `{conf['branch']}`). Ogni salvataggio viene committato qui.")
+            if err:
+                st.error(f"Ultima sincronizzazione fallita: {err}")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("⬇️ Risincronizza da GitHub", use_container_width=True):
+                    gh_startup_sync.clear()
+                    st.rerun()
+            with c2:
+                if st.button("⬆️ Carica tutto il pack su GitHub", use_container_width=True):
+                    with st.spinner("Carico il pack su GitHub…"):
+                        up_err = gh_sync(list_local_pack_files(), "Carica pack completo")
+                    if up_err:
+                        st.error(up_err)
+                    else:
+                        st.toast("Pack caricato su GitHub", icon="✅")
+            nt = get_gh_state()["nightly"]
+            if nt.get("enabled"):
+                st.caption(
+                    f"🌙 Backup notturno automatico alle {nt['hour']:02d}:00 ({nt['tz']}) · "
+                    f"prossimo: {nt.get('next_run') or '—'} · ultimo: {nt.get('last_run') or 'mai'}"
+                )
+                if nt.get("last_error"):
+                    st.warning(f"Ultimo backup notturno non riuscito: {nt['last_error']}")
+                st.caption("Parte solo se l'app è sveglia a quell'ora. I singoli salvataggi vanno comunque su GitHub subito.")
+        else:
+            st.info(
+                "GitHub non è configurato: i file restano solo sul disco di questo server (su Streamlit Cloud si "
+                "cancellano al riavvio). Imposta `GITHUB_TOKEN` e `GITHUB_REPO` nei secrets per il salvataggio permanente."
+            )
+        if st.button("📦 Prepara ZIP del resource pack", use_container_width=True):
+            st.session_state["pack_zip"] = build_pack_zip()
+        if st.session_state.get("pack_zip"):
+            st.download_button(
+                "💾 Scarica ZIP", st.session_state["pack_zip"], file_name="ResourcePack_Personalizzata.zip",
+                mime="application/zip", use_container_width=True,
+            )
+
+
 @st.cache_data(show_spinner=False, max_entries=64)
-def playable_audio(path, mtime, compat):
+def playable_audio(path, mtime):
     """
-    Restituisce (bytes, mime) pronti per st.audio.
-    In modalità compatibilità converte in MP3 (o WAV): Safari/iPhone spesso non riproducono l'OGG Vorbis.
+    Restituisce (bytes, mime) riproducibili su QUALSIASI browser (PC, iPhone, Android).
+    Safari/iPhone non legge l'OGG Vorbis, quindi l'anteprima viene convertita:
+    WAV (senza perdita) per i suoni brevi, MP3 per quelli lunghi. Il file salvato nel pack resta OGG.
     `mtime` fa invalidare la cache quando il file cambia.
     """
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 200 or (path.lower().endswith(".ogg") and not data.startswith(b"OggS")):
         raise ValueError(f"file vuoto o non valido ({len(data)} byte): rifallo/ricopialo")
-    if not compat:
-        return data, "audio/ogg"
     try:
         seg = AudioSegment.from_file(io.BytesIO(data))
         buf = io.BytesIO()
-        try:
-            seg.export(buf, format="mp3", bitrate="256k")
-            return buf.getvalue(), "audio/mpeg"
-        except Exception:
-            buf = io.BytesIO()
+        if len(seg) < 20_000:
             seg.export(buf, format="wav")
             return buf.getvalue(), "audio/wav"
+        seg.export(buf, format="mp3", bitrate="256k")
+        return buf.getvalue(), "audio/mpeg"
     except Exception:
         return data, "audio/ogg"
 
 
 def show_player(path):
-    """Mostra un player per un file su disco, gestendo errori e modalità compatibilità."""
+    """Mostra un player per un file su disco (formato compatibile con tutti i dispositivi)."""
     if not path or not os.path.exists(path):
         st.error("⚠️ File audio non trovato.")
         return
     try:
-        data, mime = playable_audio(path, os.path.getmtime(path), st.session_state.get("compat_audio", False))
+        data, mime = playable_audio(path, os.path.getmtime(path))
         st.audio(data, format=mime)
     except Exception as e:
         st.error(f"⚠️ Impossibile leggere il file: {e}")
@@ -115,36 +454,279 @@ def show_player(path):
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def decode_audio(data: bytes) -> AudioSegment:
-    """Decodifica una sola volta (non a ogni movimento di slider)."""
+    """Decodifica una sola volta."""
     return AudioSegment.from_file(io.BytesIO(data))
 
+
+def get_checked_sounds():
+    """Legge la mappa dei suoni contrassegnati come Controllato."""
+    if os.path.exists(CHECKED_JSON_PATH):
+        try:
+            with open(CHECKED_JSON_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def set_sound_checked(sound_id, is_checked):
+    """Salva la spunta Controllato su file JSON."""
+    with get_write_lock():
+        data = get_checked_sounds()
+        data[sound_id] = is_checked
+        _atomic_write_json(CHECKED_JSON_PATH, data)
+    warn = gh_sync([CHECKED_JSON_PATH], f"Controllato: {sound_id}")
+    if warn:
+        st.session_state["gh_warn"] = warn
+
+
+def delete_sound_realtime(sound_id, sound_file_path):
+    """Rimuove l'audio dal disco e aggiorna sounds.json."""
+    file_key = sound_file_path.replace(".ogg", "")
+    target_ogg_path = os.path.join(SOUNDS_DIR, f"{file_key}.ogg")
+
+    with get_write_lock():
+        if os.path.exists(target_ogg_path):
+            try:
+                os.remove(target_ogg_path)
+            except OSError:
+                pass
+        sounds_data = get_saved_sounds_manifest()
+        if sound_id in sounds_data:
+            del sounds_data[sound_id]
+            _atomic_write_json(SOUNDS_JSON_PATH, sounds_data)
+
+    warn = gh_sync([SOUNDS_JSON_PATH], f"Elimina {sound_id}", deleted=[target_ogg_path])
+    if warn:
+        st.session_state["gh_warn"] = warn
+
+
+# ---------------------------------------------------------
+# UTENTI, TESTI FISSI, PRESENZA ONLINE E BLOCCO MODIFICHE
+# ---------------------------------------------------------
+USERS = [
+    "Cai 🤓",
+    "Bubolo 🥛",
+    "Cliffy 💀",
+    "Danifio 🐗",
+    "Leoncino25 🧃",
+    "Simone 😎",
+    "Salvatore III 👃🏻",
+    "Walter 👴🏻",
+    "Cristian ☠️",
+]
+
+WELCOME_TEXT = (
+    "👋 **Benvenuto al progetto top secret ProjectCQD (Project Conserva QuarantaDue) di Cai!** "
+    "Ogni suono che caricherai verrà utilizzato per creare una resource pack su Minecraft. "
+    "Per qualsiasi problema contattatemi in qualsiasi modo."
+)
+CREDITS_TEXT = "Progetto realizzato grazie al contributo di Gemini, Claude.ai e Cai"
+
+PRESENCE_TTL = 30   # secondi senza battito = la persona risulta offline
+EDIT_TTL = 40       # secondi senza rinnovo = il blocco su un suono decade (es. chiusura della scheda)
+
+
+@st.cache_resource
+def get_live_state():
+    """Stato condiviso tra tutte le sessioni: chi è online e chi sta modificando quale suono."""
+    return {"lock": threading.Lock(), "presence": {}, "editing": {}}
+
+
+def get_sid():
+    if "sid" not in st.session_state:
+        st.session_state["sid"] = uuid.uuid4().hex
+    return st.session_state["sid"]
+
+
+def live_heartbeat():
+    """Segna questa sessione come online e rinnova i blocchi che detiene."""
+    live = get_live_state()
+    now = time.time()
+    sid = get_sid()
+    held = st.session_state.setdefault("held_locks", set())
+    with live["lock"]:
+        live["presence"][sid] = {"user": st.session_state.get("user_name", ""), "ts": now}
+        for k in [k for k, v in live["presence"].items() if now - v["ts"] > PRESENCE_TTL]:
+            del live["presence"][k]
+        for sound_id in list(held):
+            e = live["editing"].get(sound_id)
+            if e and e["sid"] == sid:
+                e["ts"] = now
+            else:
+                held.discard(sound_id)
+        for k in [k for k, v in live["editing"].items() if now - v["ts"] > EDIT_TTL]:
+            del live["editing"][k]
+
+
+def live_leave():
+    """Alla disconnessione: sparisce dagli online e libera i suoni bloccati."""
+    live = get_live_state()
+    sid = get_sid()
+    with live["lock"]:
+        live["presence"].pop(sid, None)
+        for k in [k for k, v in live["editing"].items() if v["sid"] == sid]:
+            del live["editing"][k]
+    st.session_state["held_locks"] = set()
+
+
+def live_snapshot():
+    live = get_live_state()
+    now = time.time()
+    with live["lock"]:
+        users = sorted({v["user"] for v in live["presence"].values() if v["user"] and now - v["ts"] <= PRESENCE_TTL})
+        editing = {k: dict(v) for k, v in live["editing"].items() if now - v["ts"] <= EDIT_TTL}
+    return users, editing
+
+
+def edit_owner_other(sound_id):
+    """Nome di chi sta modificando il suono da un'altra sessione, altrimenti None."""
+    live = get_live_state()
+    now = time.time()
+    with live["lock"]:
+        e = live["editing"].get(sound_id)
+        if e and e["sid"] != get_sid() and now - e["ts"] <= EDIT_TTL:
+            return e["user"]
+    return None
+
+
+def try_acquire_edit(sound_id):
+    """(True, "") se la sessione può modificare il suono, altrimenti (False, nome di chi lo sta modificando)."""
+    live = get_live_state()
+    now = time.time()
+    sid = get_sid()
+    with live["lock"]:
+        e = live["editing"].get(sound_id)
+        if e and e["sid"] != sid and now - e["ts"] <= EDIT_TTL:
+            return False, e["user"]
+        live["editing"][sound_id] = {"sid": sid, "user": st.session_state.get("user_name", ""), "ts": now}
+    st.session_state.setdefault("held_locks", set()).add(sound_id)
+    return True, ""
+
+
+def release_edit(sound_id):
+    live = get_live_state()
+    with live["lock"]:
+        e = live["editing"].get(sound_id)
+        if e and e["sid"] == get_sid():
+            del live["editing"][sound_id]
+    st.session_state.setdefault("held_locks", set()).discard(sound_id)
+
+
+@st.fragment(run_every=5)
+def render_live_panel():
+    """Pannello che si aggiorna da solo ogni 5 secondi: persone online e suoni in lavorazione."""
+    live_heartbeat()
+    users, editing = live_snapshot()
+    st.markdown(f"🟢 **{len(users)}** {'persona online' if len(users) == 1 else 'persone online'}")
+    if users:
+        st.caption("   ".join(f"🟢 {u}" for u in users))
+    if editing:
+        for sound_id, e in editing.items():
+            st.markdown(f"✍️ **{e['user']}** sta caricando «{SOUND_LABELS.get(sound_id, sound_id)}»")
+    else:
+        st.caption("Nessuno sta caricando suoni in questo momento.")
+
+
+def fmt_ts(ts):
+    try:
+        tz = ZoneInfo("Europe/Rome")
+    except Exception:
+        tz = None
+    return datetime.fromtimestamp(ts, tz).strftime("%d/%m/%Y %H:%M")
+
+
+def upload_ts(entry, path):
+    """Data di caricamento: dal manifest se c'è, altrimenti data del file su disco."""
+    ts = entry.get("uploaded_at")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def render_showcase_video():
+    """Video showcase: URL nei secrets (SHOWCASE_VIDEO_URL) oppure file showcase.mp4/.webm/.mov nel repository."""
+    url = _secret("SHOWCASE_VIDEO_URL")
+    src = None
+    if url:
+        src = re.sub(r"https://github\.com/([^/]+/[^/]+)/blob/(.+)", r"https://raw.githubusercontent.com/\1/\2", str(url).strip())
+    else:
+        for cand in ("showcase.mp4", "showcase.webm", "showcase.mov",
+                     os.path.join("showcase", "showcase.mp4"), os.path.join("showcase", "showcase.webm")):
+            if os.path.exists(cand):
+                src = cand
+                break
+    if not src:
+        st.info("Il video showcase sarà disponibile a breve.")
+        return
+    try:
+        st.video(src)
+    except Exception as e:
+        st.warning(f"Impossibile caricare il video: {e}")
+
+
+# Avvio: ripristino da GitHub + pianificatore del backup notturno (prima del login)
+gh_startup_sync()
+start_nightly_scheduler()
 
 # ---------------------------------------------------------
 # 1. AUTENTICAZIONE E SESSIONE ISOLATA
 # ---------------------------------------------------------
+def _login_token(name):
+    return hmac.new(ACCESS_PASSWORD.encode("utf-8"), name.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def _insecure_remote_context():
+    """True se l'app è aperta via http:// da un indirizzo diverso da localhost (il microfono sarebbe bloccato)."""
+    try:
+        url = str(st.context.url)
+    except Exception:
+        return False
+    return url.startswith("http://") and not re.match(r"http://(localhost|127\.0\.0\.1|\[::1\])", url)
+
+
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 if "user_name" not in st.session_state:
     st.session_state["user_name"] = ""
 
+# Rientro automatico dopo un ricaricamento della pagina (se l'utente ha scelto "Resta connesso")
+if not st.session_state["authenticated"]:
+    _qu, _qt = st.query_params.get("u"), st.query_params.get("t")
+    if _qu in USERS and _qt and hmac.compare_digest(str(_qt), _login_token(str(_qu))):
+        st.session_state["authenticated"] = True
+        st.session_state["user_name"] = str(_qu)[:40]
+
 if not st.session_state["authenticated"]:
     st.title("🔒 Accesso Riservato - Minecraft Sound Studio Pro")
-    st.write("Inserisci il tuo Nickname e la Password per accedere al progetto.")
+    st.info(WELCOME_TEXT)
+    st.write("Scegli chi sei dalla lista e inserisci la Password per accedere al progetto.")
 
     with st.form("login_form"):
-        input_name = st.text_input("👤 Il tuo Nome / Nickname:")
+        input_name = st.selectbox("👤 Chi sei?", USERS, index=None, placeholder="Scegli il tuo nome…")
         input_pass = st.text_input("🔑 Password di Accesso:", type="password")
-        submit_btn = st.form_submit_button("🚀 Accedi allo Studio", type="primary")
+        stay_logged = st.checkbox("Resta connesso su questo dispositivo", value=False)
+        submit_btn = st.form_submit_button("🚀 Accedi allo Studio", type="primary", use_container_width=True)
 
         if submit_btn:
             if not hmac.compare_digest(input_pass.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
                 st.error("❌ Password errata! Riprova.")
-            elif not input_name.strip():
-                st.warning("⚠️ Inserisci un nome utente valido.")
+            elif input_name not in USERS:
+                st.warning("⚠️ Scegli chi sei dalla lista.")
             else:
+                name = input_name
                 st.session_state["authenticated"] = True
-                st.session_state["user_name"] = input_name.strip()[:40]
+                st.session_state["user_name"] = name
+                if stay_logged:
+                    st.query_params["u"] = name
+                    st.query_params["t"] = _login_token(name)
                 st.rerun()
+    st.divider()
+    st.caption(CREDITS_TEXT)
     st.stop()
 
 # ---------------------------------------------------------
@@ -157,7 +739,7 @@ def find_original_sound_file(base_dir, relative_path):
 
     dir_name, file_name = os.path.split(relative_path)
     stem, ext = os.path.splitext(file_name)
-    base_stem = stem.rstrip("0123456789")  # hurt1 -> hurt
+    base_stem = stem.rstrip("0123456789")
 
     search_dir = os.path.join(base_dir, dir_name)
     if os.path.isdir(search_dir):
@@ -380,7 +962,8 @@ VANILLA_SOUNDS_MAP = [
     {"id": "music.dragon", "file": "music/game/end/boss.ogg", "label": "Musica - Boss Drago dell'End", "cat": "🎵 Ambiente, UI & Dischi"}
 ]
 
-# Vecchi ID / percorsi (versioni precedenti dell'app): i suoni già salvati vengono spostati in automatico
+SOUND_LABELS = {s["id"]: s["label"] for s in VANILLA_SOUNDS_MAP}
+
 LEGACY_ENTRIES = [
     ('entity.player.hurt', 'entity/player/hurt1.ogg', 'entity.player.hurt', 'damage/hit1.ogg'),
     ('entity.player.big_fall', 'entity/player/big_fall.ogg', 'entity.player.big_fall', 'damage/fallbig.ogg'),
@@ -436,7 +1019,7 @@ def get_saved_sounds_manifest():
 
 
 def _atomic_write_json(path, data):
-    """Scrive su file temporaneo e poi sostituisce: niente JSON a metà se l'app si interrompe."""
+    """Scrive su file temporaneo e poi sostituisce."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -445,7 +1028,7 @@ def _atomic_write_json(path, data):
 
 
 def is_valid_audio_file(path):
-    """File presente, non vuoto e con intestazione OGG valida (altrimenti il player mostra 0:00)."""
+    """File presente, non vuoto e con intestazione OGG valida."""
     try:
         if not os.path.exists(path) or os.path.getsize(path) < 200:
             return False
@@ -456,7 +1039,7 @@ def is_valid_audio_file(path):
 
 
 def migrate_legacy_entries():
-    """Sposta suoni e voci di sounds.json salvati con vecchi ID/percorsi verso quelli corretti."""
+    """Sposta suoni e voci di sounds.json salvati con vecchi ID/percorsi."""
     with get_write_lock():
         manifest = get_saved_sounds_manifest()
         changed = False
@@ -477,26 +1060,23 @@ def migrate_legacy_entries():
 
 
 def save_sound_realtime(sound_id, sound_file_path, audio_segment, user_name):
-    """Salva l'OGG e aggiorna sounds.json. Restituisce (ok, messaggio_errore)."""
+    """Salva l'OGG e aggiorna sounds.json."""
     file_key = sound_file_path.replace(".ogg", "")
     target_ogg_path = os.path.join(SOUNDS_DIR, f"{file_key}.ogg")
     tmp_ogg_path = target_ogg_path + ".tmp"
 
-    is_music_track = file_key.startswith("music/")      # musica di sottofondo: stereo
-    is_long = len(audio_segment) >= 10_000              # >10 s: meglio in streaming
+    is_music_track = file_key.startswith("music/")
+    is_long = len(audio_segment) >= 10_000
 
     try:
         os.makedirs(os.path.dirname(target_ogg_path), exist_ok=True)
 
-        # Evita il clipping: porta il picco massimo a -1 dBFS solo se lo supera
         if audio_segment.max_dBFS > -1.0:
             audio_segment = audio_segment.apply_gain(-1.0 - audio_segment.max_dBFS)
 
-        # I suoni posizionali di Minecraft devono essere MONO; le musiche (music/) restano stereo
         channels = 2 if is_music_track else 1
-        # Niente resampling: si mantiene la frequenza originale (Minecraft la gestisce da solo)
         out = audio_segment.set_channels(channels)
-        vorbis_quality = "8" if is_long else "10"   # qualità VBR (max 10): praticamente trasparente
+        vorbis_quality = "8" if is_long else "10"
 
         with get_write_lock():
             out.export(tmp_ogg_path, format="ogg", codec="libvorbis", parameters=["-q:a", vorbis_quality])
@@ -517,10 +1097,15 @@ def save_sound_realtime(sound_id, sound_file_path, audio_segment, user_name):
             sounds_data[sound_id] = {
                 "replace": True,
                 "author": user_name,
+                "uploaded_at": time.time(),
                 "description": f"Audio personalizzato caricato da {user_name}",
                 "sounds": [{"name": file_key, "stream": bool(is_music_track or is_long)}],
             }
             _atomic_write_json(SOUNDS_JSON_PATH, sounds_data)
+
+        warn = gh_sync([target_ogg_path, SOUNDS_JSON_PATH, MCMETA_PATH], f"Salva {sound_id} ({user_name})")
+        if warn:
+            st.session_state["gh_warn"] = warn   # salvato in locale, ma non su GitHub
         return True, ""
     except Exception as e:
         if os.path.exists(tmp_ogg_path):
@@ -534,23 +1119,38 @@ def save_sound_realtime(sound_id, sound_file_path, audio_segment, user_name):
 # 5. INTESTAZIONE & DASHBOARD SUONI COMPLETATI
 # ---------------------------------------------------------
 st.title("🎵 Minecraft Sound Studio Pro")
+live_heartbeat()
+st.info(WELCOME_TEXT)
+
+with st.expander("🎬 Guarda il video showcase (come funziona)", expanded=False):
+    render_showcase_video()
+
+with st.container(border=True):
+    render_live_panel()
 
 flash_msg = st.session_state.pop("flash", None)
 if flash_msg:
     st.toast(flash_msg, icon="✅")
 
+gh_warn_msg = st.session_state.pop("gh_warn", None)
+if gh_warn_msg:
+    st.warning(f"⚠️ Salvato sul server ma NON su GitHub: {gh_warn_msg}. Usa «Carica tutto il pack su GitHub» per riprovare.")
+
+gh_startup_sync()
 migrate_legacy_entries()
 saved_manifest = get_saved_sounds_manifest()
+checked_manifest = get_checked_sounds()
 total_sounds = len(VANILLA_SOUNDS_MAP)
 
-# Calcolo UNA volta sola quali suoni sono completati
 done_map = {}
+ts_map = {}
 completed_items = []
 for s in VANILLA_SOUNDS_MAP:
     p = sound_path_for(s)
     done = is_valid_audio_file(p) and s["id"] in saved_manifest
     done_map[s["id"]] = done
     if done:
+        ts_map[s["id"]] = upload_ts(saved_manifest[s["id"]], p)
         completed_items.append({
             "label": s["label"],
             "id": s["id"],
@@ -561,24 +1161,30 @@ for s in VANILLA_SOUNDS_MAP:
 completed_count = len(completed_items)
 progress_pct = (completed_count / total_sounds) * 100.0 if total_sounds else 0.0
 
-st.sidebar.subheader("📈 Progresso Pacchetto Audio")
-st.sidebar.progress(progress_pct / 100.0)
-st.sidebar.metric("Suoni Completati", f"{completed_count} / {total_sounds}", f"{progress_pct:.1f}%")
+if _insecure_remote_context():
+    st.warning(
+        "🎙️ Stai usando l'app via **http://**: su telefono il microfono funziona solo con **HTTPS** "
+        "(il caricamento dei file funziona comunque). Apri l'app da un indirizzo https:// per registrare."
+    )
 
-st.sidebar.checkbox(
-    "🌐 Modalità compatibilità (Safari / iPhone)",
-    key="compat_audio",
-    help="Converte le anteprime in MP3 se il browser non riproduce i file .ogg.",
-)
+st.progress(progress_pct / 100.0)
+head_a, head_b = st.columns([3, 1])
+with head_a:
+    st.caption(
+        f"📈 **{completed_count} / {total_sounds}** suoni completati ({progress_pct:.1f}%)  |  "
+        f"Utente: **{st.session_state['user_name']}** ⚡"
+    )
+with head_b:
+    if st.button("🚪 Disconnetti", use_container_width=True):
+        live_leave()
+        st.session_state["authenticated"] = False
+        st.session_state["user_name"] = ""
+        st.query_params.clear()
+        st.rerun()
 
-st.caption(f"Utente collegato: **{st.session_state['user_name']}** | Salvataggio in tempo reale ⚡")
+render_storage_panel()
 
-if st.sidebar.button("🚪 Disconnetti"):
-    st.session_state["authenticated"] = False
-    st.session_state["user_name"] = ""
-    st.rerun()
-
-# --- GALLERY SUONI COMPLETATI (player caricati solo su richiesta) ---
+# --- GALLERY SUONI COMPLETATI ---
 GALLERY_MAX = 30
 with st.expander(f"🏆 Galleria Suoni Completati ({completed_count}/{total_sounds})", expanded=False):
     if not completed_items:
@@ -598,65 +1204,88 @@ with st.expander(f"🏆 Galleria Suoni Completati ({completed_count}/{total_soun
 st.divider()
 
 # ---------------------------------------------------------
-# 6. FILTRI AVANZATI NEL MENU LATERALE
+# 6. FILTRI (nella pagina, così si vedono anche da telefono)
 # ---------------------------------------------------------
-st.sidebar.header("🔍 Filtri Avanzati")
-
-search_query = st.sidebar.text_input("Cerca per nome o ID:", "").lower().strip()
-
-selected_cat = st.sidebar.radio(
-    "Categoria:",
-    ["Tutti i suoni", "⚔️ Combat & Danni", "👾 Mob & Creature", "🧱 Blocchi & Interazioni", "🎵 Ambiente, UI & Dischi"],
-)
-
-filter_status = st.sidebar.selectbox(
-    "Stato Completamento:",
-    ["Tutti", "✅ Solo Completati", "⏳ Non Completati"],
-)
+with st.expander("🔍 Filtri e ricerca", expanded=False):
+    search_query = st.text_input("Cerca per nome o ID:", "").lower().strip()
+    selected_cat = st.selectbox(
+        "Categoria:",
+        ["Tutti i suoni", "⚔️ Combat & Danni", "👾 Mob & Creature", "🧱 Blocchi & Interazioni", "🎵 Ambiente, UI & Dischi"],
+    )
+    filter_status = st.selectbox(
+        "Stato Completamento:",
+        ["Tutti", "✅ Solo Completati", "⏳ Non Completati", "🇨🇳 Controllato"],
+    )
+    SORT_OPTIONS = ["Ordine predefinito", "🆕 Dal più recente al più vecchio", "🕰️ Dal più vecchio al più recente"]
+    sort_mode = st.selectbox("Ordina per data di caricamento:", SORT_OPTIONS)
 
 filtered_sounds = []
 for s in VANILLA_SOUNDS_MAP:
     is_done = done_map[s["id"]]
+    is_checked = checked_manifest.get(s["id"], False)
     if selected_cat != "Tutti i suoni" and s["cat"] != selected_cat:
         continue
     if filter_status == "✅ Solo Completati" and not is_done:
         continue
     if filter_status == "⏳ Non Completati" and is_done:
         continue
+    if filter_status == "🇨🇳 Controllato" and not is_checked:
+        continue
     if search_query and (search_query not in s["label"].lower() and search_query not in s["id"].lower()):
         continue
     filtered_sounds.append(s)
+
+if sort_mode != SORT_OPTIONS[0]:
+    # i suoni caricati vanno ordinati per data; quelli ancora senza audio restano in fondo
+    with_date = [s for s in filtered_sounds if s["id"] in ts_map]
+    without_date = [s for s in filtered_sounds if s["id"] not in ts_map]
+    with_date.sort(key=lambda s: ts_map[s["id"]], reverse=(sort_mode == SORT_OPTIONS[1]))
+    filtered_sounds = with_date + without_date
 
 st.write(f"📊 Suoni Trovati: **{len(filtered_sounds)}**")
 
 # ---------------------------------------------------------
 # 7. SCHEDE SUONI & EDITOR DIRETTO
 # ---------------------------------------------------------
-filter_sig = (search_query, selected_cat, filter_status)
+filter_sig = (search_query, selected_cat, filter_status, sort_mode)
 if "visible_count" not in st.session_state or st.session_state.get("filter_sig") != filter_sig:
-    st.session_state["visible_count"] = 10   # riparte da 10 quando cambi filtro
+    st.session_state["visible_count"] = 10
     st.session_state["filter_sig"] = filter_sig
 
 displayed_sounds = filtered_sounds[: st.session_state["visible_count"]]
 
-cols = st.columns(2)
+cols = None
 
 for index, sound_info in enumerate(displayed_sounds):
+    if index % 2 == 0:
+        cols = st.columns(2)   # una riga alla volta: sul telefono le schede restano in ordine
     col = cols[index % 2]
     sound_id = sound_info["id"]
     custom_saved_file_path = sound_path_for(sound_info)
 
     is_already_saved = done_map[sound_id]
     saved_author = saved_manifest.get(sound_id, {}).get("author", "Utente Sconosciuto")
+    is_checked = checked_manifest.get(sound_id, False)
 
     version_key = f"v_{sound_id}"
     if version_key not in st.session_state:
         st.session_state[version_key] = 0
     v = st.session_state[version_key]
 
+    confirm_del_key = f"confirm_del_{sound_id}"
+
     with col:
         with st.container(border=True):
-            st.markdown(f"### {sound_info['label']}")
+            # INTESTAZIONE CON SPUNTA CONTROLLATO IN ALTO A DESTRA
+            head_col1, head_col2 = st.columns([3, 1])
+            with head_col1:
+                st.markdown(f"### {sound_info['label']}")
+            with head_col2:
+                chk_val = st.checkbox("Controllato", value=is_checked, key=f"chk_{sound_id}")
+                if chk_val != is_checked:
+                    set_sound_checked(sound_id, chk_val)
+                    st.rerun()
+
             st.caption(f"🆔 ID Minecraft: `{sound_id}`")
 
             # --- SUONO ORIGINALE ---
@@ -671,36 +1300,85 @@ for index, sound_info in enumerate(displayed_sounds):
 
             # --- AUDIO PERSONALIZZATO ---
             if is_already_saved:
-                st.success(f"🟢 **Audio Presente** (Autore: **{saved_author}**)")
+                st.success(
+                    f"🟢 **Audio Presente** (Autore: **{saved_author}**)  \n"
+                    f"📅 Caricato il {fmt_ts(ts_map[sound_id])}"
+                )
                 show_player(custom_saved_file_path)
+
+                # PULSANTE E CONFERMA ELIMINAZIONE
+                del_col1, del_col2 = st.columns([2, 1])
+                with del_col2:
+                    if is_checked:
+                        st.button("🗑️ Elimina", key=f"del_{sound_id}", disabled=True, help="Rimuovi la spunta 'Controllato' per eliminare questo audio")
+                    else:
+                        if not st.session_state.get(confirm_del_key, False):
+                            if st.button("🗑️ Elimina Audio", key=f"del_{sound_id}", type="secondary"):
+                                st.session_state[confirm_del_key] = True
+                                st.rerun()
+
+                # BOX DI CONFERMA ELIMINAZIONE
+                if st.session_state.get(confirm_del_key, False) and not is_checked:
+                    st.warning("⚠️ **Sei sicuro di voler eliminare questo audio?** L'azione non è reversibile.")
+                    c_col1, c_col2 = st.columns(2)
+                    with c_col1:
+                        if st.button("⚠️ Sì, elimina definitivamente", key=f"yes_del_{sound_id}", type="primary", use_container_width=True):
+                            delete_sound_realtime(sound_id, sound_info["file"])
+                            st.session_state[confirm_del_key] = False
+                            st.session_state["flash"] = f"Eliminato l'audio «{sound_info['label']}»"
+                            st.rerun()
+                    with c_col2:
+                        if st.button("Annulla", key=f"no_del_{sound_id}", use_container_width=True):
+                            st.session_state[confirm_del_key] = False
+                            st.rerun()
+
                 st.markdown("**🔄 Sostituisci Audio:**")
             else:
                 st.markdown("**📤 Carica File o Registra dal Microfono:**")
 
+            locked_by = edit_owner_other(sound_id)
+            if locked_by:
+                st.warning(f"🔒 **{locked_by}** sta modificando questo suono in questo momento. Attendi che finisca.")
+
             # 1. Caricamento File
             uploaded_file = st.file_uploader(
                 "Carica File Audio",
-                type=["mp3", "wav", "ogg", "m4a", "flac"],
+                type=["mp3", "wav", "ogg", "m4a", "flac", "aac", "opus", "webm", "mp4", "3gp", "amr", "caf"],
                 key=f"file_{sound_id}_{v}",
                 label_visibility="collapsed",
+                disabled=bool(locked_by),
             )
 
             # 2. Registratore Microfono Diretto
             recorded_audio = None
             if hasattr(st, "audio_input"):
                 try:
-                    # Default di Streamlit = 16 kHz (suona "compresso"): qui registriamo a 48 kHz
                     recorded_audio = st.audio_input(
-                        "🎙️ Registra Microfono", key=f"rec_{sound_id}_{v}", sample_rate=48000
+                        "🎙️ Registra Microfono", key=f"rec_{sound_id}_{v}", sample_rate=48000,
+                        disabled=bool(locked_by),
                     )
-                except TypeError:  # Streamlit vecchio senza il parametro sample_rate
-                    recorded_audio = st.audio_input("🎙️ Registra Microfono", key=f"rec_{sound_id}_{v}")
+                except TypeError:
+                    recorded_audio = st.audio_input(
+                        "🎙️ Registra Microfono", key=f"rec_{sound_id}_{v}", disabled=bool(locked_by)
+                    )
                     st.caption("⚠️ Aggiorna Streamlit (`pip install -U streamlit`) per registrare a qualità piena.")
             else:
                 st.caption("🎙️ Registrazione non disponibile: aggiorna Streamlit (`pip install -U streamlit`).")
 
             candidate_file = uploaded_file or recorded_audio
             from_mic = candidate_file is not None and candidate_file is recorded_audio and uploaded_file is None
+
+            # Blocco: solo una persona alla volta può modificare lo stesso suono
+            if candidate_file is not None:
+                got_lock, lock_owner = try_acquire_edit(sound_id)
+                if not got_lock:
+                    st.error(f"✋ **{lock_owner}** ha appena iniziato a modificare questo suono. Riprova quando ha finito.")
+                    if st.button("Scarta il mio file", key=f"discard_{sound_id}_{v}", use_container_width=True):
+                        st.session_state[version_key] += 1
+                        st.rerun()
+                    candidate_file = None
+            elif sound_id in st.session_state.get("held_locks", set()):
+                release_edit(sound_id)   # file rimosso: libera il suono per gli altri
 
             # --- EDITOR AUDIO ---
             if candidate_file is not None:
@@ -711,13 +1389,13 @@ for index, sound_info in enumerate(displayed_sounds):
                     file_bytes = candidate_file.getvalue()
                     if not file_bytes:
                         raise ValueError("il file è vuoto")
-                    file_id = hashlib.md5(file_bytes).hexdigest()[:8]   # cambia chiave se cambia il file
+                    file_id = hashlib.md5(file_bytes).hexdigest()[:8]
                     raw_audio = decode_audio(file_bytes)
 
                     if from_mic:
                         cut_click = st.checkbox(
                             "Rimuovi il click iniziale del mouse (primi 350 ms)",
-                            value=True,
+                            value=False,
                             key=f"click_{sound_id}_{v}_{file_id}",
                         )
                         if cut_click and len(raw_audio) > 400:
@@ -744,7 +1422,6 @@ for index, sound_info in enumerate(displayed_sounds):
                         else:
                             edited_audio = raw_audio[start_ms:end_ms].apply_gain(vol_gain)
 
-                            # WAV per anteprime brevi (compatibile ovunque), MP3 per quelle lunghe
                             buf = io.BytesIO()
                             if len(edited_audio) < 30_000:
                                 edited_audio.export(buf, format="wav")
@@ -763,6 +1440,7 @@ for index, sound_info in enumerate(displayed_sounds):
                                         sound_id, sound_info["file"], edited_audio, st.session_state["user_name"]
                                     )
                                     if ok:
+                                        release_edit(sound_id)
                                         st.session_state[version_key] += 1
                                         st.session_state["flash"] = (
                                             f"Salvato «{sound_info['label']}» da {st.session_state['user_name']}!"
@@ -772,6 +1450,7 @@ for index, sound_info in enumerate(displayed_sounds):
                                         st.error(f"Errore salvataggio: {err}")
                             with btn_col2:
                                 if st.button("❌ Annulla / Scarta", key=f"cancel_{sound_id}_{v}", use_container_width=True):
+                                    release_edit(sound_id)
                                     st.session_state[version_key] += 1
                                     st.rerun()
                     else:
@@ -785,3 +1464,6 @@ if len(displayed_sounds) < len(filtered_sounds):
     if st.button("👇 Carica altri suoni...", use_container_width=True, type="secondary"):
         st.session_state["visible_count"] += 10
         st.rerun()
+
+st.divider()
+st.caption(CREDITS_TEXT)
