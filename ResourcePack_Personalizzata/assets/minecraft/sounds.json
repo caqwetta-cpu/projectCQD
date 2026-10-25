@@ -43,18 +43,6 @@
       }
     ]
   },
-  "entity.player.attack.crit": {
-    "replace": true,
-    "author": "Cai 🤓",
-    "uploaded_at": 1792928224.3604522,
-    "description": "Audio personalizzato caricato da Cai 🤓",
-    "sounds": [
-      {
-        "name": "entity/player/attack/crit1",
-        "stream": false
-      }
-    ]
-  },
   "entity.player.attack.strong": {
     "replace": true,
     "author": "Cai",
