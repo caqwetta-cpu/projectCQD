@@ -1,5 +1,6 @@
 {
   "entity.player.big_fall": false,
   "entity.player.hurt": false,
-  "entity.player.small_fall": true
+  "entity.player.small_fall": true,
+  "item.bow.shoot": true
 }
